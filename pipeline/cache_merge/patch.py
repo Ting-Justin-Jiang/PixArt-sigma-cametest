@@ -7,7 +7,7 @@ import torch
 import logging
 from . import merge
 from .utils import isinstance_str, init_generator
-from typing import Type, Dict, Any, Tuple, Callable
+from typing import Optional, Type, Dict, Any, Tuple, Callable
 from diffusion.model.nets.PixArt_blocks import t2i_modulate
 
 
@@ -121,7 +121,6 @@ def make_guiding_attention(block_class: Type[torch.nn.Module]) -> Type[torch.nn.
     return PatchedGuidingAttention
 
 
-
 def make_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
     class PatchedPixArtMSBlock(block_class):
         _parent = block_class
@@ -146,35 +145,126 @@ def make_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]
     return PatchedPixArtMSBlock
 
 
+def make_diffusers_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
+    class PatchedBasicTransformerBlock(block_class):
+        _parent = block_class
+
+        def forward(self,
+                    hidden_states: torch.Tensor,
+                    attention_mask: Optional[torch.Tensor] = None,
+                    encoder_hidden_states: Optional[torch.Tensor] = None,
+                    encoder_attention_mask: Optional[torch.Tensor] = None,
+                    timestep: Optional[torch.LongTensor] = None,
+                    cross_attention_kwargs: Dict[str, Any] = None,
+                    class_labels: Optional[torch.LongTensor] = None,
+                    added_cond_kwargs: Optional[Dict[str, torch.Tensor]] = None,
+                    ) -> torch.Tensor:
+            """
+            Adapted from Huggingface Diffuser
+            """
+
+            # 0. Self-Attention
+            batch_size = hidden_states.shape[0]
+
+            if self.norm_type == "ada_norm_single":
+                shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
+                        self.scale_shift_table[None] + timestep.reshape(batch_size, 6, -1)
+                ).chunk(6, dim=1)
+                norm_hidden_states = self.norm1(hidden_states)
+                norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
+                norm_hidden_states = norm_hidden_states.squeeze(1)
+            else:
+                raise ValueError("Incorrect norm used.")
+
+
+            # 1. Prepare GLIGEN inputs
+            cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
+            gligen_kwargs = cross_attention_kwargs.pop("gligen", None)
+
+            attn_output = self.attn1(
+                norm_hidden_states,
+                encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
+                attention_mask=attention_mask,
+                **cross_attention_kwargs,
+            )
+            attn_output = gate_msa * attn_output
+
+            hidden_states = attn_output + hidden_states
+            if hidden_states.ndim == 4:
+                hidden_states = hidden_states.squeeze(1)
+
+
+            # 2. GLIGEN Control
+            if gligen_kwargs is not None:
+                hidden_states = self.fuser(hidden_states, gligen_kwargs["objs"])
+
+
+            # 3. Cross-Attention
+            if self.attn2 is not None:
+                if self.norm_type == "ada_norm_single":
+                    # For PixArt norm2 isn't applied here:
+                    # https://github.com/PixArt-alpha/PixArt-alpha/blob/0f55e922376d8b797edd44d25d0e7464b260dcab/diffusion/model/nets/PixArtMS.py#L70C1-L76C103
+                    norm_hidden_states = hidden_states
+                else:
+                    raise ValueError("Incorrect norm")
+
+                if self.pos_embed is not None and self.norm_type != "ada_norm_single":
+                    norm_hidden_states = self.pos_embed(norm_hidden_states)
+
+                attn_output = self.attn2(
+                    norm_hidden_states,
+                    encoder_hidden_states=encoder_hidden_states,
+                    attention_mask=encoder_attention_mask,
+                    **cross_attention_kwargs,
+                )
+                hidden_states = attn_output + hidden_states
+
+
+            # 4. Feed-forward
+            norm_hidden_states = self.norm2(hidden_states)
+            norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
+
+            ff_output = self.ff(norm_hidden_states)
+            ff_output = gate_mlp * ff_output
+
+            hidden_states = ff_output + hidden_states
+            if hidden_states.ndim == 4:
+                hidden_states = hidden_states.squeeze(1)
+
+            return hidden_states
+
+
+    return PatchedBasicTransformerBlock
+
+
 def make_guiding_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
     class PatchedGuidingBlock(block_class):
         _parent = block_class
 
         def forward(self, x: torch.Tensor, c: torch.Tensor = None) -> torch.Tensor:
-            # todo: Guiding Blocks need to be adapted
+            # todo: Guiding Blocks and Proportional Attention need to be adapted for HuggingFace & PixArt
+            # Calculate the guidance ratio
+            step = self._cache.step
+            if step <= self._tome_info['args']['upscale_disable_after']:
+                initial_ratio = 0.75
+                self._cache.guiding_ratio = initial_ratio * (1 - (step - 1) / (self._tome_info['args']['upscale_disable_after'] - 1))
+                if step >= 1:
+                    logging.debug(f"\033[93mUpscale Guiding ratio: {self._cache.guiding_ratio}\033[0m")
+            else:
+                self._cache.guiding_ratio = 0.0
 
-            # # Calculate the guidance ratio
-            # step = self._cache.step
-            # if step <= self._tome_info['args']['upscale_disable_after']:
-            #     initial_ratio = 0.75
-            #     self._cache.guiding_ratio = initial_ratio * (1 - (step - 1) / (self._tome_info['args']['upscale_disable_after'] - 1))
-            #     if step >= 1:
-            #         logging.debug(f"\033[93mUpscale Guiding ratio: {self._cache.guiding_ratio}\033[0m")
-            # else:
-            #     self._cache.guiding_ratio = 0.0
-            #
-            # shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-            #
-            # x_a = modulate(self.norm1(x), shift_msa, scale_msa)
-            # m_a, _, u_a, _ = compute_merge(x_a, self._tome_info, self._cache)
-            #
-            # m_x_a, size = merge.merge_wavg(m_a, x_a, self._tome_info['args']['proportional_attention']) # return merged x, size
-            # x = x + gate_msa.unsqueeze(1) * u_a(self.attn(m_x_a, size))
-            #
-            # x_m = modulate(self.norm2(x), shift_mlp, scale_mlp)
-            # x = x + gate_mlp.unsqueeze(1) * self.mlp(x_m)
-            #
-            # self._cache.step += 1
+            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
+
+            x_a = t2i_modulate(self.norm1(x), shift_msa, scale_msa)
+            m_a, _, u_a, _ = compute_merge(x_a, self._tome_info, self._cache)
+
+            m_x_a, size = merge.merge_wavg(m_a, x_a, self._tome_info['args']['proportional_attention']) # return merged x, size
+            x = x + gate_msa.unsqueeze(1) * u_a(self.attn(m_x_a, size))
+
+            x_m = t2i_modulate(self.norm2(x), shift_mlp, scale_mlp)
+            x = x + gate_mlp.unsqueeze(1) * self.mlp(x_m)
+
+            self._cache.step += 1
             return x
 
     return PatchedGuidingBlock
@@ -189,7 +279,7 @@ def patch_tome_blocks(model: torch.nn.Module, start_indices: list[int], num_bloc
         block_ranges.extend(range(start, start + num))
 
     for name, module in model.named_modules():
-        if isinstance_str(module, "PixArtMSBlock"):
+        if isinstance_str(module, "PixArtMSBlock") or isinstance_str(module, "BasicTransformerBlock"):
             index += 1
             if not upscale_guiding:
                 if index in block_ranges:
@@ -222,18 +312,30 @@ def generate_semi_random_indices(sy: int, sx: int, h: int, w: int, steps: int) -
     return rand_idx
 
 
-def reset_cache(model: torch.nn.Module):
+def reset_cache(pipeline: torch.nn.Module):
+
+    is_diffusers = isinstance_str(pipeline, "PixArtSigmaPipeline")
+    if is_diffusers:
+        logging.info("Patching model from Huggingface Diffuser")
+        model = pipeline.transformer
+    else:
+        logging.info("Patching model from source code")
+        model = pipeline
+
     model._bus = CacheBus()
     for _, module in model.named_modules():
-        if isinstance_str(module, "PatchedPixArtMSBlock") or isinstance_str(module, "PatchedGuidingBlock"):
+        if (isinstance_str(module, "PatchedPixArtMSBlock")
+                or isinstance_str(module, "PatchedBasicTransformerBlock")
+                or isinstance_str(module, "PatchedGuidingBlock")):
             index = module._cache.index
             module._cache = Cache(index=index, cache_bus=model._bus)
             logging.debug(f"\033[96mCache Reset\033[0m: for index: \033[91m{index}\033[0m")
-    return model
+
+    return pipeline
 
 
 def apply_patch(
-        model: torch.nn.Module,
+        pipeline: torch.nn.Module,
 
         # == DiT blocks to merge == #
         start_indices: list[int],
@@ -255,8 +357,9 @@ def apply_patch(
 
         # == Branch Feature == #
         upscale_guiding: int = 0,
-        proportional_attention: bool = True
+        proportional_attention: bool = False
 ):
+
     # == merging preparation ==
     # todo: Fix the latent_size with hooking for non-regular HW size
     global DEBUG_MODE
@@ -275,6 +378,17 @@ def apply_patch(
 
     if not upscale_guiding:
         proportional_attention = False
+
+    # Ensure provided model is PixArtMS
+    is_diffusers = isinstance_str(pipeline, "PixArtSigmaPipeline")
+    if is_diffusers:
+        logging.info("Patching model from Huggingface Diffuser")
+        model = pipeline.transformer
+    elif isinstance_str(pipeline, "PixArtMS"):
+        logging.info("Patching model from source code")
+        model = pipeline
+    else:
+        raise RuntimeError("Provided model was not a PixArtMS model, as expected.")
 
     logging.info(
         "\033[96mArguments:\n"
@@ -333,13 +447,14 @@ def apply_patch(
 
     # Patch PixArtMS Blocks
     for module, index in patch_tome_blocks(model, start_indices, num_blocks):
-        module.__class__ = make_tome_block(module.__class__)
+        make_tome_block_fn = make_diffusers_tome_block if is_diffusers else make_tome_block
+        module.__class__ = make_tome_block_fn(module.__class__)
         module._tome_info = model._tome_info
 
         module._cache = Cache(index=index, cache_bus=model._bus)
-        logging.debug('Applied token merging patch at PixArtMSBlock %d', index)
+        logging.debug(f'Applied token merging patch at Block {index}')
 
-    # Patch Guiding Blocks
+    # Patch Guiding Blocks (Warning: Deprecated)
     if model._tome_info['args']['upscale_guiding']:
         for module, attn, index in patch_tome_blocks(model, start_indices, num_blocks, upscale_guiding=True):
             module.__class__ = make_guiding_block(module.__class__)
@@ -347,9 +462,9 @@ def apply_patch(
             module._tome_info = model._tome_info
 
             module._cache = Cache(index=index, cache_bus=model._bus)
-            logging.debug('Applied upscale guidance patch at DiTBlock %d', index)
+            logging.debug('Applied upscale guidance patch at Block %d', index)
 
-    return model
+    return pipeline
 
 
 def remove_patch(model: torch.nn.Module):
