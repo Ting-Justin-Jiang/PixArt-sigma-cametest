@@ -1,5 +1,10 @@
+"""
+Something is still off. 8Bit T5 trades performance for memory cost.
+"""
+
 import argparse
 import sys
+import time
 from pathlib import Path
 current_file_path = Path(__file__).resolve()
 sys.path.insert(0, str(current_file_path.parent.parent))
@@ -12,9 +17,7 @@ from diffusers.models import AutoencoderKL
 from tools.download import find_model
 from datetime import datetime
 from typing import List, Union
-import gradio as gr
 import numpy as np
-from gradio.components import Textbox, Image
 from transformers import T5EncoderModel, T5Tokenizer
 import gc
 
@@ -26,34 +29,49 @@ from diffusion.data.datasets.utils import *
 from asset.examples import examples
 from diffusion.utils.dist_utils import flush
 
+from prompt import PROMPT
+from torchvision.utils import save_image
+from cache_merge import patch
+
 
 MAX_SEED = np.iinfo(np.int32).max
 
 
 def get_args():
     parser = argparse.ArgumentParser()
+    # == Model configuration == #
     parser.add_argument('--image_size', default=1024, type=int)
     parser.add_argument('--version', default='sigma', type=str)
-    parser.add_argument('--model_path', default='output/pretrained_models/PixArt-XL-2-1024-MS.pth', type=str)
+    parser.add_argument('--model_path', default='output/pretrained_models/PixArt-Sigma-XL-2-1024-MS.pth', type=str)
     parser.add_argument('--sdvae', action='store_true', help='sd vae')
-    parser.add_argument(
-        "--pipeline_load_from", default='output/pretrained_models/pixart_sigma_sdxlvae_T5_diffusers',
-        type=str, help="Download for loading text_encoder, "
-                       "tokenizer and vae from https://huggingface.co/PixArt-alpha/pixart_sigma_sdxlvae_T5_diffusers"
-    )
-    parser.add_argument(F'--port', default=7788, type=int)
+
+    # == Sampling configuration == #
+    parser.add_argument('--seed', default=512, type=int, help='Seed for the random generator')
+    parser.add_argument('--sampler', default='dpm-solver', type=str, choices=['iddpm', 'dpm-solver', 'sa-solver'])
+    parser.add_argument('--sample_steps', default=20, type=int, help='Number of inference steps')
+    parser.add_argument('--guidance_scale', default=7.0, type=float, help='Guidance scale')
+
+    # ==== ==== ==== ==== ==== ==== ==== ==== ==== #
+    # ==== Token Merging Configuration ==== #
+    parser.add_argument('--experiment-folder', type=str, default='samples/experiment/inference')
+    parser.add_argument("--merge-ratio", type=float, default=0.5, help="Ratio of tokens to merge")
+    parser.add_argument("--start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[9, 21])
+    parser.add_argument("--num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[8, 3])
+
+    # == Improvements == #
+    parser.add_argument("--semi-rand-schedule", action=argparse.BooleanOptionalAction, type=bool, default=False)
+    parser.add_argument("--unmerge-residual", action=argparse.BooleanOptionalAction, type=bool, default=False)
+    parser.add_argument("--push-unmerged", action=argparse.BooleanOptionalAction, type=bool, default=False)
+
+    # == Hybrid Unmerge == #
+    parser.add_argument("--hybrid-unmerge", type=float, default=0.0,
+                        help="cosine similarity threshold, set 0.0 to bypass")
+
+    # == Branch Features == #
+    parser.add_argument("--upscale-guiding", type=int, default=0, help="guiding disable at, set 0 to bypass")
+    parser.add_argument("--proportional-attention", action=argparse.BooleanOptionalAction, type=bool, default=False)
 
     return parser.parse_args()
-
-
-@torch.no_grad()
-def ndarr_image(tensor: Union[torch.Tensor, List[torch.Tensor]], **kwargs,) -> None:
-    if not torch.jit.is_scripting() and not torch.jit.is_tracing():
-        _log_api_usage_once(save_image)
-    grid = make_grid(tensor, **kwargs)
-    # Add 0.5 after unnormalizing to [0, 255] to round to the nearest integer
-    ndarr = grid.mul(255).add_(0.5).clamp_(0, 255).permute(1, 2, 0).to("cpu", torch.uint8).numpy()
-    return ndarr
 
 
 def set_env(seed=0):
@@ -96,7 +114,9 @@ def generate_img(prompt, sampler, sample_steps, scale, seed=0, randomize_seed=Fa
     null_y = null_caption_embs.repeat(len(prompts), 1, 1)[:, None]
 
     latent_size_h, latent_size_w = int(hw[0, 0]//8), int(hw[0, 1]//8)
+
     # Sample images:
+    start = time.time()
     if sampler == 'iddpm':
         # Create sampling noise:
         n = len(prompts)
@@ -144,9 +164,10 @@ def generate_img(prompt, sampler, sample_steps, scale, seed=0, randomize_seed=Fa
 
     samples = samples.to(weight_dtype)
     samples = vae.decode(samples / vae.config.scaling_factor).sample
+    runtime = (time.time() - start)
+
     samples = resize_and_crop_tensor(samples, custom_hw[0,1], custom_hw[0,0])
-    display_model_info = f'Model path: {args.model_path},\nBase image size: {args.image_size}, \nSampling Algo: {sampler}'
-    return ndarr_image(samples, normalize=True, value_range=(-1, 1)), prompt_show, display_model_info, seed
+    return samples.squeeze(0), runtime
 
 
 if __name__ == '__main__':
@@ -182,14 +203,30 @@ if __name__ == '__main__':
     logger.warning(f'Missing keys: {missing}')
     logger.warning(f'Unexpected keys: {unexpected}')
     model.to(weight_dtype)
+
+    if args.merge_ratio > 0.0:
+        model = patch.apply_patch(model,
+                                 start_indices=args.start_indices,
+                                 num_blocks=args.num_blocks,
+                                 ratio=args.merge_ratio,
+                                 sx=2, sy=2, latent_size=latent_size,
+
+                                 semi_rand_schedule=args.semi_rand_schedule,
+                                 unmerge_residual=args.unmerge_residual,
+                                 push_unmerged=args.push_unmerged,
+
+                                 hybrid_unmerge=args.hybrid_unmerge,
+
+                                 # == Branch Feature == #
+                                 upscale_guiding=args.upscale_guiding,
+                                 proportional_attention=args.proportional_attention)
+
     model.eval()
     base_ratios = eval(f'ASPECT_RATIO_{args.image_size}_TEST')
 
     if args.sdvae:
-        # pixart-alpha vae link: https://huggingface.co/PixArt-alpha/PixArt-alpha/tree/main/sd-vae-ft-ema
         vae = AutoencoderKL.from_pretrained("output/pretrained_models/sd-vae-ft-ema").to(device).to(weight_dtype)
     else:
-        # pixart-Sigma vae link: https://huggingface.co/PixArt-alpha/pixart_sigma_sdxlvae_T5_diffusers/tree/main/vae
         vae = AutoencoderKL.from_pretrained(f"PixArt-alpha/pixart_sigma_sdxlvae_T5_diffusers", subfolder="vae").to(device).to(weight_dtype)
 
     tokenizer = T5Tokenizer.from_pretrained("PixArt-alpha/pixart_sigma_sdxlvae_T5_diffusers", subfolder="tokenizer")
@@ -197,61 +234,35 @@ if __name__ == '__main__':
     null_caption_token = tokenizer("", max_length=max_sequence_length, padding="max_length", truncation=True, return_tensors="pt").to(device)
     null_caption_embs = text_encoder(null_caption_token.input_ids, attention_mask=null_caption_token.attention_mask)[0]
 
-    title = f"""
-        '' Unleashing your Creativity \n ''
-        <div style='display: flex; align-items: center; justify-content: center; text-align: center;'>
-            <img src='https://raw.githubusercontent.com/PixArt-alpha/PixArt-sigma-project/master/static/images/logo-sigma.png' style='width: 400px; height: auto; margin-right: 10px;' />
-            {args.image_size}px
-        </div>
-    """
-    DESCRIPTION = f"""# PixArt-Sigma {args.image_size}px
-            ## If PixArt-Sigma is helpful, please help to ⭐ the [Github Repo](https://github.com/PixArt-alpha/PixArt-sigma) and recommend it to your friends ��'
-            #### [PixArt-Sigma {args.image_size}px](https://github.com/PixArt-alpha/PixArt-sigma) is a transformer-based text-to-image diffusion system trained on text embeddings from T5. This demo uses the [PixArt-Sigma](https://huggingface.co/PixArt-alpha/PixArt-Sigma) checkpoint.
-            #### English prompts ONLY; 提示词仅限英文
-            """
-    if not torch.cuda.is_available():
-        DESCRIPTION += "\n<p>Running on CPU �� This demo does not work on CPU.</p>"
+    prompts = PROMPT
+    outputs = []
+    total_runtime = 0.
+    os.makedirs(args.experiment_folder, exist_ok=True)
 
-    demo = gr.Interface(
-        fn=generate_img,
-        inputs=[Textbox(label="Note: If you want to specify a aspect ratio or determine a customized height and width, "
-                              "use --ar h:w (or --aspect_ratio h:w) or --hw h:w. If no aspect ratio or hw is given, all setting will be default.",
-                        placeholder="Please enter your prompt. \n"),
-                gr.Radio(
-                    choices=["iddpm", "dpm-solver", "sa-solver"],
-                    label=f"Sampler",
-                    interactive=True,
-                    value='dpm-solver',
-                ),
-                gr.Slider(
-                    label='Sample Steps',
-                    minimum=1,
-                    maximum=100,
-                    value=14,
-                    step=1
-                ),
-                gr.Slider(
-                    label='Guidance Scale',
-                    minimum=0.1,
-                    maximum=30.0,
-                    value=4.5,
-                    step=0.1
-                ),
-                gr.Slider(
-                    label="Seed",
-                    minimum=0,
-                    maximum=MAX_SEED,
-                    step=1,
-                    value=0,
-                ),
-                gr.Checkbox(label="Randomize seed", value=True),
-                ],
-        outputs=[Image(type="numpy", label="Img"),
-                 Textbox(label="clean prompt"),
-                 Textbox(label="model info"),
-                 gr.Slider(label='seed')],
-        title=title,
-        description=DESCRIPTION,
-        examples=examples
-    )
-    demo.launch(server_name="0.0.0.0", server_port=args.port, debug=True, share=True)
+    # multi-sampling
+    for prompt in prompts:
+        output, runtime = generate_img(prompt, args.sampler, args.sample_steps, args.guidance_scale, seed=args.seed, randomize_seed=False)
+        outputs.append(output)
+        total_runtime += runtime
+        patch.reset_cache(model)
+
+    outputs = torch.stack(outputs, dim=0)
+
+    # Save and display images:
+    if args.merge_ratio > 0.0:
+        if args.hybrid_unmerge > 0.0:
+            save_path = (
+                f"{args.experiment_folder}/hybrid_unmerge-{args.merge_ratio}-{args.start_indices}-threshold-{args.hybrid_unmerge}-"
+                f"push_unmerged-{args.push_unmerged}.png")
+        else:
+            if args.unmerge_residual:
+                save_path = (f"{args.experiment_folder}/cache_unmerge-{args.merge_ratio}-{args.start_indices}-"
+                             f"push_unmerged-{args.push_unmerged}.png")
+            else:
+                save_path = f"{args.experiment_folder}/token_unmerge-{args.merge_ratio}-{args.start_indices}.png"
+    else:
+        save_path = f"{args.experiment_folder}/no-merge.png"
+
+    save_image(outputs, save_path, nrow=4, normalize=True, value_range=(-1, 1))
+
+    print(f"Finish sampling {len(prompts)} images in {total_runtime} seconds.")
