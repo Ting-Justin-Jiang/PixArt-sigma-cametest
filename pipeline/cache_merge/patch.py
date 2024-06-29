@@ -67,7 +67,7 @@ def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any], cache: Cache) -> T
     # retrieve (or create) semi-random merging schedule
     if tome_info['args']['semi_rand_schedule']:
         if cache.index not in cache.cache_bus.rand_indices:
-            rand_indices = generate_semi_random_indices(tome_info["args"]['sx'], tome_info["args"]['sy'], h, w, steps=250)
+            rand_indices = generate_semi_random_indices(tome_info["args"]['sx'], tome_info["args"]['sy'], h, w, steps=20)
             cache.cache_bus.rand_indices[cache.index] = rand_indices
             logging.debug(
                 f"\033[96mSemi Random Schedule\033[0m: Initial push to cache index: \033[91m{cache.index}\033[0m")
@@ -172,34 +172,25 @@ def make_diffusers_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.
                 ).chunk(6, dim=1)
                 norm_hidden_states = self.norm1(hidden_states)
                 norm_hidden_states = norm_hidden_states * (1 + scale_msa) + shift_msa
+                m_a, _, u_a, _ = compute_merge(norm_hidden_states, self._tome_info, self._cache)
                 norm_hidden_states = norm_hidden_states.squeeze(1)
             else:
                 raise ValueError("Incorrect norm used.")
 
-
-            # 1. Prepare GLIGEN inputs
             cross_attention_kwargs = cross_attention_kwargs.copy() if cross_attention_kwargs is not None else {}
-            gligen_kwargs = cross_attention_kwargs.pop("gligen", None)
 
-            attn_output = self.attn1(
-                norm_hidden_states,
+            attn_output = u_a(self.attn1(
+                m_a(norm_hidden_states),
                 encoder_hidden_states=encoder_hidden_states if self.only_cross_attention else None,
                 attention_mask=attention_mask,
                 **cross_attention_kwargs,
-            )
+            ))
             attn_output = gate_msa * attn_output
 
             hidden_states = attn_output + hidden_states
-            if hidden_states.ndim == 4:
-                hidden_states = hidden_states.squeeze(1)
 
 
-            # 2. GLIGEN Control
-            if gligen_kwargs is not None:
-                hidden_states = self.fuser(hidden_states, gligen_kwargs["objs"])
-
-
-            # 3. Cross-Attention
+            # 1. Cross-Attention
             if self.attn2 is not None:
                 if self.norm_type == "ada_norm_single":
                     # For PixArt norm2 isn't applied here:
@@ -207,9 +198,6 @@ def make_diffusers_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.
                     norm_hidden_states = hidden_states
                 else:
                     raise ValueError("Incorrect norm")
-
-                if self.pos_embed is not None and self.norm_type != "ada_norm_single":
-                    norm_hidden_states = self.pos_embed(norm_hidden_states)
 
                 attn_output = self.attn2(
                     norm_hidden_states,
@@ -220,7 +208,7 @@ def make_diffusers_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.
                 hidden_states = attn_output + hidden_states
 
 
-            # 4. Feed-forward
+            # 2. Feed-forward
             norm_hidden_states = self.norm2(hidden_states)
             norm_hidden_states = norm_hidden_states * (1 + scale_mlp) + shift_mlp
 
@@ -228,8 +216,8 @@ def make_diffusers_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.
             ff_output = gate_mlp * ff_output
 
             hidden_states = ff_output + hidden_states
-            if hidden_states.ndim == 4:
-                hidden_states = hidden_states.squeeze(1)
+
+            self._cache.step += 1
 
             return hidden_states
 
@@ -316,10 +304,10 @@ def reset_cache(pipeline: torch.nn.Module):
 
     is_diffusers = isinstance_str(pipeline, "PixArtSigmaPipeline")
     if is_diffusers:
-        logging.info("Patching model from Huggingface Diffuser")
+        logging.info("Resetting model: Huggingface Diffuser")
         model = pipeline.transformer
     else:
-        logging.info("Patching model from source code")
+        logging.info("Resetting model: source code")
         model = pipeline
 
     model._bus = CacheBus()
@@ -335,7 +323,7 @@ def reset_cache(pipeline: torch.nn.Module):
 
 
 def apply_patch(
-        pipeline: torch.nn.Module,
+        model: torch.nn.Module,
 
         # == DiT blocks to merge == #
         start_indices: list[int],
@@ -380,13 +368,11 @@ def apply_patch(
         proportional_attention = False
 
     # Ensure provided model is PixArtMS
-    is_diffusers = isinstance_str(pipeline, "PixArtSigmaPipeline")
+    is_diffusers = isinstance_str(model, "PixArtTransformer2DModel")
     if is_diffusers:
         logging.info("Patching model from Huggingface Diffuser")
-        model = pipeline.transformer
-    elif isinstance_str(pipeline, "PixArtMS"):
+    elif isinstance_str(model, "PixArtMS"):
         logging.info("Patching model from source code")
-        model = pipeline
     else:
         raise RuntimeError("Provided model was not a PixArtMS model, as expected.")
 
@@ -464,7 +450,7 @@ def apply_patch(
             module._cache = Cache(index=index, cache_bus=model._bus)
             logging.debug('Applied upscale guidance patch at Block %d', index)
 
-    return pipeline
+    return model
 
 
 def remove_patch(model: torch.nn.Module):

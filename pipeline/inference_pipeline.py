@@ -40,9 +40,9 @@ MAX_SEED = np.iinfo(np.int32).max
 def get_args():
     parser = argparse.ArgumentParser()
     # == Model configuration == #
-    parser.add_argument('--image_size', default=1024, type=int)
+    parser.add_argument('--image_size', default=2048, type=int)
     parser.add_argument('--version', default='sigma', type=str)
-    parser.add_argument('--model_path', default='output/pretrained_models/PixArt-Sigma-XL-2-1024-MS.pth', type=str)
+    parser.add_argument('--model_path', default='output/pretrained_models/PixArt-Sigma-XL-2-2K-MS.pth', type=str)
     parser.add_argument('--sdvae', action='store_true', help='sd vae')
 
     # == Sampling configuration == #
@@ -54,9 +54,9 @@ def get_args():
     # ==== ==== ==== ==== ==== ==== ==== ==== ==== #
     # ==== Token Merging Configuration ==== #
     parser.add_argument('--experiment-folder', type=str, default='samples/experiment/inference')
-    parser.add_argument("--merge-ratio", type=float, default=0.5, help="Ratio of tokens to merge")
+    parser.add_argument("--merge-ratio", type=float, default=0.65, help="Ratio of tokens to merge")
     parser.add_argument("--start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[9, 21])
-    parser.add_argument("--num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[8, 3])
+    parser.add_argument("--num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[8, 2])
 
     # == Improvements == #
     parser.add_argument("--semi-rand-schedule", action=argparse.BooleanOptionalAction, type=bool, default=False)
