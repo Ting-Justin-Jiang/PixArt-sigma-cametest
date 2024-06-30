@@ -46,7 +46,7 @@ def get_args():
     parser.add_argument('--sdvae', action='store_true', help='sd vae')
 
     # == Sampling configuration == #
-    parser.add_argument('--seed', default=512, type=int, help='Seed for the random generator')
+    parser.add_argument('--seed', default=0, type=int, help='Seed for the random generator')
     parser.add_argument('--sampler', default='dpm-solver', type=str, choices=['iddpm', 'dpm-solver', 'sa-solver'])
     parser.add_argument('--sample_steps', default=20, type=int, help='Number of inference steps')
     parser.add_argument('--guidance_scale', default=7.0, type=float, help='Guidance scale')
@@ -54,22 +54,18 @@ def get_args():
     # ==== ==== ==== ==== ==== ==== ==== ==== ==== #
     # ==== Token Merging Configuration ==== #
     parser.add_argument('--experiment-folder', type=str, default='samples/experiment/inference')
-    parser.add_argument("--merge-ratio", type=float, default=0.65, help="Ratio of tokens to merge")
-    parser.add_argument("--start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[9, 21])
-    parser.add_argument("--num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[8, 2])
+    parser.add_argument("--merge-ratio", type=float, default=0.5, help="Ratio of tokens to merge")
+    parser.add_argument("--start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[8, 21])
+    parser.add_argument("--num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[9, 3])
 
     # == Improvements == #
-    parser.add_argument("--semi-rand-schedule", action=argparse.BooleanOptionalAction, type=bool, default=False)
-    parser.add_argument("--unmerge-residual", action=argparse.BooleanOptionalAction, type=bool, default=False)
-    parser.add_argument("--push-unmerged", action=argparse.BooleanOptionalAction, type=bool, default=False)
+    parser.add_argument("--unmerge-residual", action=argparse.BooleanOptionalAction, type=bool, default=True)
+    parser.add_argument("--cache_step", type=lambda s: (int(item) for item in s.split(',')), default=(4, 15))
+    parser.add_argument("--push-unmerged", action=argparse.BooleanOptionalAction, type=bool, default=True)
 
-    # == Hybrid Unmerge == #
+    # == Hybrid Unmerge (Deprecated) == #
     parser.add_argument("--hybrid-unmerge", type=float, default=0.0,
                         help="cosine similarity threshold, set 0.0 to bypass")
-
-    # == Branch Features == #
-    parser.add_argument("--upscale-guiding", type=int, default=0, help="guiding disable at, set 0 to bypass")
-    parser.add_argument("--proportional-attention", action=argparse.BooleanOptionalAction, type=bool, default=False)
 
     return parser.parse_args()
 
@@ -209,17 +205,13 @@ if __name__ == '__main__':
                                  start_indices=args.start_indices,
                                  num_blocks=args.num_blocks,
                                  ratio=args.merge_ratio,
-                                 sx=2, sy=2, latent_size=latent_size,
+                                 sx=1, sy=3, latent_size=latent_size,
 
-                                 semi_rand_schedule=args.semi_rand_schedule,
                                  unmerge_residual=args.unmerge_residual,
+                                 cache_step=args.cache_step,
                                  push_unmerged=args.push_unmerged,
 
-                                 hybrid_unmerge=args.hybrid_unmerge,
-
-                                 # == Branch Feature == #
-                                 upscale_guiding=args.upscale_guiding,
-                                 proportional_attention=args.proportional_attention)
+                                 hybrid_unmerge=args.hybrid_unmerge)
 
     model.eval()
     base_ratios = eval(f'ASPECT_RATIO_{args.image_size}_TEST')

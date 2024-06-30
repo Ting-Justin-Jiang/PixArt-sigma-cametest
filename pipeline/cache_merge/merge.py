@@ -28,15 +28,8 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
                                      rand_indices: torch.Tensor = None) -> Tuple[Callable, Callable]:
     B, N, _ = metric.shape
 
-    def initial_push(x: torch.Tensor):
-        cache.push(x)
-        return x
-
     if r <= 0:
         return do_nothing, do_nothing
-
-    if cache.feature_map is None and tome_info['args']['unmerge_residual']:
-        return do_nothing, initial_push
 
     gather = mps_gather_workaround if metric.device.type == "mps" else torch.gather
 
@@ -47,7 +40,7 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
         if no_rand:
             rand_idx = torch.zeros(hsy, wsx, 1, device=metric.device, dtype=torch.int64)
         else:
-            if tome_info['args']['semi_rand_schedule']:
+            if tome_info['args']['unmerge_residual']:
                 # retrieve from a pre-defined semi-random schedule
                 rand_idx = rand_indices[cache.step].to(generator.device)
             else:
@@ -72,7 +65,7 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
         del idx_buffer, idx_buffer_view
 
         # rand_idx is currently dst|src, so split them
-        num_dst = hsy * wsx
+        num_dst = hsy * wsx # this assumes we only choose one dst from a grid
         a_idx = rand_idx[:, num_dst:, :]  # src
         b_idx = rand_idx[:, :num_dst, :]  # dst
 
@@ -85,13 +78,37 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
         # Cosine similarity between A and B
         metric = metric / metric.norm(dim=-1, keepdim=True)
         a, b = split(metric)
-        scores = a @ b.transpose(-1, -2)
+        spatial_scores = a @ b.transpose(-1, -2)
 
         # Can't reduce more than the # tokens in src
         r = min(a.shape[1], r)
 
         # Find the most similar greedily
-        node_max, node_idx = scores.max(dim=-1)
+        node_max, node_idx = spatial_scores.max(dim=-1)
+
+        if tome_info['args']['unmerge_residual'] and tome_info['args']['cache_start'] <= cache.step <= tome_info['args']['cache_end']:
+            # # deprecated
+            # Normalize the cached feature map
+            cached_metric = cache.feature_map / cache.feature_map.norm(dim=-1, keepdim=True)
+
+            # Retrieve node_idx calculated from both tensors
+            metric_max = gather(metric, dim=1, index=node_idx.unsqueeze(-1).expand(B, N - num_dst, metric.shape[-1]))
+            cached_max = gather(cached_metric, dim=1, index=node_idx.unsqueeze(-1).expand(B, N - num_dst, metric.shape[-1]))
+
+            # # Calculate cosine similarity (Deprecated)
+            temporal_score = metric_max @ cached_max.transpose(-1, -2)
+            temporal_score = temporal_score.diagonal(dim1=-2, dim2=-1) # Get diagonal elements which correspond to the similarity of each index
+
+            # # Calculate MSE
+            # temporal_score = torch.mean((metric_max - cached_max) ** 2, dim=-1)
+
+            logging.debug(f"Temporal similarity mean: {temporal_score.mean(dim=1)}")
+            logging.debug(f"Temporal similarity max: {temporal_score.max(dim=1)[0]}")
+
+            node_max = node_max + temporal_score
+            del cached_metric, metric_max, cached_max
+
+
         edge_idx = node_max.argsort(dim=-1, descending=True)[..., None]
 
         unm_idx = edge_idx[..., r:, :]  # Unmerged Tokens
@@ -107,26 +124,32 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
             tome_src_idx, tome_dst_idx = (src_idx[..., :r_c, :], dst_idx[..., :r_c, :])
             came_src_idx, came_dst_idx = (src_idx[..., r_c:, :], dst_idx[..., r_c:, :])
 
-        def merge(x: torch.Tensor, mode="mean") -> torch.Tensor:
-            src, dst = split(x)
-            n, t1, c = src.shape
+    def merge(x: torch.Tensor, mode="mean") -> torch.Tensor:
+        src, dst = split(x)
+        n, t1, c = src.shape
 
-            unm = gather(src, dim=-2, index=unm_idx.expand(n, t1 - r, c))
-            src = gather(src, dim=-2, index=src_idx.expand(n, r, c))
-            dst = dst.scatter_reduce_(-2, dst_idx.expand(n, r, c), src, reduce=mode)
+        unm = gather(src, dim=-2, index=unm_idx.expand(n, t1 - r, c))
+        src = gather(src, dim=-2, index=src_idx.expand(n, r, c))
+        dst = dst.scatter_reduce_(-2, dst_idx.expand(n, r, c), src, reduce=mode)
 
-            # Simply concat
-            out = torch.cat([unm, dst], dim=1)
-            logging.debug(f"\033[96mMerge\033[0m: feature map merged from \033[95m{x.shape}\033[0m to \033[95m{out.shape}\033[0m "
-                          f"at block index: \033[91m{cache.index}\033[0m")
-            return out
+        # Simply concat
+        out = torch.cat([unm, dst], dim=1)
+        logging.debug(f"\033[96mMerge\033[0m: feature map merged from \033[95m{x.shape}\033[0m to \033[95m{out.shape}\033[0m "
+                      f"at block index: \033[91m{cache.index}\033[0m")
+        return out
 
-        def unmerge(x: torch.Tensor) -> torch.Tensor:
-            unm_len = unm_idx.shape[1]
-            unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
-            _, _, c = unm.shape
+
+    def unmerge(x: torch.Tensor) -> torch.Tensor:
+        unm_len = unm_idx.shape[1]
+        unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
+        _, _, c = unm.shape
+
+        if tome_info['args']['unmerge_residual'] and tome_info['args']['cache_start'] <= cache.step <= tome_info['args']['cache_end']:
+            # == Branch 1: Improved Merging middle steps
+            # Only proceed improved unmerging mechanism during middle steps
 
             if tome_info['args']['hybrid_unmerge']:
+                # == SubBranch 1: Hybrid Unmerge
                 # use hybrid unmerging: both cache and dup computation
                 cache.push(dst, index=b_idx.expand(B, num_dst, c))
                 if tome_info['args']['push_unmerged']:
@@ -139,10 +162,9 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
                 tome_dst_idx_expanded = tome_dst_idx.expand(B, r_c, c)
                 tome_src = gather(dst, dim=-2, index=tome_dst_idx_expanded)
 
-                logging.debug(
-                    f"\033[92mHybrid Unmerging: duplicate approximate (tome) src token {tome_src.shape}, "
-                    f"cached approximate (came) src token {came_src.shape}\033[0m")
+                logging.debug(f"\033[92mHybrid Unmerging: duplicate approximate (tome) src token {tome_src.shape}, cached approximate (came) src token {came_src.shape}\033[0m")
 
+                # == Combine back to the original shape (Branch 1 SubBranch 1)
                 out = torch.zeros(B, N, c, device=x.device, dtype=x.dtype)
                 out.scatter_(dim=-2, index=b_idx.expand(B, num_dst, c), src=dst)
                 out.scatter_(dim=-2, index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=unm_idx).expand(B, unm_len, c), src=unm)
@@ -151,34 +173,32 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
                 return out
 
             else:
-                if tome_info['args']['unmerge_residual']:
-                    # push the updated dst tokens to cache, and pop the src tokens store in cache
-                    cache.push(dst, index=b_idx.expand(B, num_dst, c))
-                    if tome_info['args']['push_unmerged']:
-                        # maybe...just maybe, we should also push unmerged
-                        cache.push(unm, index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=unm_idx).expand(B, unm_len, c))
-                    src = cache.pop(index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=src_idx).expand(B, r, c))
-                else:
-                    # vanilla unmerging
-                    src = gather(dst, dim=-2, index=dst_idx.expand(B, r, c))
+                # == SubBranch 2: Cache Unmerge
+                cache.push(dst, index=b_idx.expand(B, num_dst, c))
+                if tome_info['args']['push_unmerged']:
+                    cache.push(unm, index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=unm_idx).expand(B, unm_len, c))
+                src = cache.pop(index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=src_idx).expand(B, r, c))
 
-                # Combine back to the original shape
-                out = torch.zeros(B, N, c, device=x.device, dtype=x.dtype)
-                out.scatter_(dim=-2, index=b_idx.expand(B, num_dst, c), src=dst)
-                out.scatter_(dim=-2, index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=unm_idx).expand(B, unm_len, c), src=unm)
-                out.scatter_(dim=-2, index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=src_idx).expand(B, r, c), src=src)
-                return out
+        else:
+            # == Branch 2: Token Merging & Improved Merging first/last steps
+            # Proceed vanilla token unmerging, while updating the cache if cache unmerging is enabled
+            if tome_info['args']['unmerge_residual'] and cache.feature_map is not None:
+                cache.push(dst, index=b_idx.expand(B, num_dst, c))
+                if tome_info['args']['push_unmerged']:
+                    cache.push(unm, index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=unm_idx).expand(B, unm_len, c))
+
+            src = gather(dst, dim=-2, index=dst_idx.expand(B, r, c))
+
+        # == Combine back to the original shape （Branch 1 SubBranch 2 & Branch 2)
+        out = torch.zeros(B, N, c, device=x.device, dtype=x.dtype)
+        out.scatter_(dim=-2, index=b_idx.expand(B, num_dst, c), src=dst)
+        out.scatter_(dim=-2, index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=unm_idx).expand(B, unm_len, c), src=unm)
+        out.scatter_(dim=-2, index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=src_idx).expand(B, r, c), src=src)
+
+        # For the first step
+        if tome_info['args']['unmerge_residual'] and cache.feature_map is None:
+            cache.push(out)
+
+        return out
 
     return merge, unmerge
-
-
-def merge_wavg(merge: Callable, x: torch.Tensor, proportional_attention: bool = True) -> Tuple[torch.Tensor, torch.Tensor]:
-    if proportional_attention:
-        size = torch.ones_like(x[..., 0, None])
-        x = merge(x, mode="mean")
-        size = merge(size, mode="sum")
-        return x, size
-    else:
-        x = merge(x, mode="mean")
-        size = torch.ones_like(x[..., 0, None])
-        return x, size

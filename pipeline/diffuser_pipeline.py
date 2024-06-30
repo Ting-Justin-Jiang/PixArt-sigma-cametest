@@ -13,30 +13,26 @@ from utils import save_grid
 def get_args():
     parser = argparse.ArgumentParser()
     # == Model configuration == #
-    parser.add_argument('--model_path', default='PixArt-alpha/PixArt-Sigma-XL-2-2K-MS', type=str)
-    parser.add_argument('--seed', default=42, type=int, help='Seed for the random generator')
+    parser.add_argument('--model_path', default='PixArt-alpha/PixArt-Sigma-XL-2-1024-MS', type=str)
+    parser.add_argument('--seed', default=82, type=int, help='Seed for the random generator')
     parser.add_argument('--sample_steps', default=20, type=int, help='Number of inference steps')
     parser.add_argument('--guidance_scale', default=7.0, type=float, help='Guidance scale')
 
     # ==== ==== ==== ==== ==== ==== ==== ==== ==== #
     # ==== Token Merging Configuration ==== #
     parser.add_argument('--experiment-folder', type=str, default='samples/experiment/diffuser')
-    parser.add_argument("--merge-ratio", type=float, default=0.4, help="Ratio of tokens to merge")
+    parser.add_argument("--merge-ratio", type=float, default=0.5, help="Ratio of tokens to merge")
     parser.add_argument("--start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[9, 21])
     parser.add_argument("--num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[8, 2])
 
     # == Improvements == #
-    parser.add_argument("--semi-rand-schedule", action=argparse.BooleanOptionalAction, type=bool, default=False)
-    parser.add_argument("--unmerge-residual", action=argparse.BooleanOptionalAction, type=bool, default=False)
-    parser.add_argument("--push-unmerged", action=argparse.BooleanOptionalAction, type=bool, default=False)
+    parser.add_argument("--unmerge-residual", action=argparse.BooleanOptionalAction, type=bool, default=True)
+    parser.add_argument("--cache_step", type=lambda s: (int(item) for item in s.split(',')), default=(5, 15))
+    parser.add_argument("--push-unmerged", action=argparse.BooleanOptionalAction, type=bool, default=True)
 
     # == Hybrid Unmerge == #
     parser.add_argument("--hybrid-unmerge", type=float, default=0.0,
                         help="cosine similarity threshold, set 0.0 to bypass")
-
-    # == Branch Features == #
-    parser.add_argument("--upscale-guiding", type=int, default=0, help="guiding disable at, set 0 to bypass")
-    parser.add_argument("--proportional-attention", action=argparse.BooleanOptionalAction, type=bool, default=False)
 
     return parser.parse_args()
 
@@ -59,17 +55,13 @@ if __name__ == '__main__':
                                   start_indices=args.start_indices,
                                   num_blocks=args.num_blocks,
                                   ratio=args.merge_ratio,
-                                  sx=2, sy=2, latent_size=256, # change later
+                                  sx=2, sy=2, latent_size=128, # change later
 
-                                  semi_rand_schedule=args.semi_rand_schedule,
                                   unmerge_residual=args.unmerge_residual,
+                                  cache_step=args.cache_step,
                                   push_unmerged=args.push_unmerged,
 
-                                  hybrid_unmerge=args.hybrid_unmerge,
-
-                                  # == Branch Feature == #
-                                  upscale_guiding=args.upscale_guiding,
-                                  proportional_attention=args.proportional_attention)
+                                  hybrid_unmerge=args.hybrid_unmerge)
 
     pipe = PixArtSigmaPipeline.from_pretrained(
         "PixArt-alpha/pixart_sigma_sdxlvae_T5_diffusers",
@@ -88,8 +80,8 @@ if __name__ == '__main__':
     for prompt in prompts:
         start = time.time()
         image = pipe(prompt,
-                     height=2048,  # change later
-                     width=2048,
+                     height=1024,  # change later
+                     width=1024,
                      num_inference_steps=args.sample_steps,
                      guidance_scale=args.guidance_scale
                      ).images[0]
@@ -114,6 +106,6 @@ if __name__ == '__main__':
     else:
         save_path = f"{args.experiment_folder}/no-merge.png"
 
-    save_grid(outputs, num_rows=4, output_path=save_path)
+    save_grid(outputs, num_rows=1, output_path=save_path)
     print(f"Finish sampling {len(prompts)} images in {total_runtime} seconds.")
     print("Enjoy!")

@@ -21,7 +21,6 @@ class Cache:
         self.cache_bus = cache_bus
         self.feature_map = None
         self.index = index
-        self.guiding_ratio = None
         self.step = 0
 
     def push(self, x: torch.Tensor, index: torch.Tensor = None) -> None:
@@ -47,12 +46,7 @@ def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any], cache: Cache) -> T
     # x is ([2 * bs, 1024, 1152]) if 512 model
     # x is ([2 * bs, 16384, 1152]) if 2048 model
     h, w = tome_info["size"]
-    if cache.guiding_ratio: # for upscale guidance
-        r = int(x.shape[1] * cache.guiding_ratio)
-    elif cache.guiding_ratio == 0.0:
-        r = 0
-    else:
-        r = int(x.shape[1] * args["ratio"])
+    r = int(x.shape[1] * args["ratio"])
 
     # Re-init the generator if it hasn't already been initialized or device has changed.
     if args["generator"] is None:
@@ -65,9 +59,9 @@ def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any], cache: Cache) -> T
     use_rand = False if x.shape[0] % 2 == 1 else args["use_rand"]
 
     # retrieve (or create) semi-random merging schedule
-    if tome_info['args']['semi_rand_schedule']:
+    if tome_info['args']['unmerge_residual']:
         if cache.index not in cache.cache_bus.rand_indices:
-            rand_indices = generate_semi_random_indices(tome_info["args"]['sx'], tome_info["args"]['sy'], h, w, steps=20)
+            rand_indices = generate_semi_random_indices(tome_info["args"]['sy'], tome_info["args"]['sx'], h, w, steps=20)
             cache.cache_bus.rand_indices[cache.index] = rand_indices
             logging.debug(
                 f"\033[96mSemi Random Schedule\033[0m: Initial push to cache index: \033[91m{cache.index}\033[0m")
@@ -83,42 +77,6 @@ def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any], cache: Cache) -> T
     m_m, u_m = (m, u) if args["merge_mlp"] else (merge.do_nothing, merge.do_nothing)
 
     return m_a, m_m, u_a, u_m
-
-
-def make_guiding_attention(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
-    class PatchedGuidingAttention(block_class):
-        def forward(
-                self, x: torch.Tensor, size: torch.Tensor = None
-        ) -> Tuple[torch.Tensor, torch.Tensor]:
-            # Note: this is copied from timm.models.vision_transformer.Attention with modifications.
-            B, N, C = x.shape
-            qkv = (
-                self.qkv(x)
-                .reshape(B, N, 3, self.num_heads, C // self.num_heads)
-                .permute(2, 0, 3, 1, 4)
-            )
-            q, k, v = (
-                qkv[0],
-                qkv[1],
-                qkv[2],
-            )  # make torchscript happy (cannot use tensor as tuple)
-
-            attn = (q @ k.transpose(-2, -1)) * self.scale
-
-            # Apply proportional attention
-            if size is not None:
-                attn = attn + size.log()[:, None, None, :, 0]
-
-            attn = attn.softmax(dim=-1)
-            attn = self.attn_drop(attn)
-
-            x = (attn @ v).transpose(1, 2).reshape(B, N, C)
-            x = self.proj(x)
-            x = self.proj_drop(x)
-
-            return x
-
-    return PatchedGuidingAttention
 
 
 def make_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
@@ -225,40 +183,7 @@ def make_diffusers_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.
     return PatchedBasicTransformerBlock
 
 
-def make_guiding_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
-    class PatchedGuidingBlock(block_class):
-        _parent = block_class
-
-        def forward(self, x: torch.Tensor, c: torch.Tensor = None) -> torch.Tensor:
-            # todo: Guiding Blocks and Proportional Attention need to be adapted for HuggingFace & PixArt
-            # Calculate the guidance ratio
-            step = self._cache.step
-            if step <= self._tome_info['args']['upscale_disable_after']:
-                initial_ratio = 0.75
-                self._cache.guiding_ratio = initial_ratio * (1 - (step - 1) / (self._tome_info['args']['upscale_disable_after'] - 1))
-                if step >= 1:
-                    logging.debug(f"\033[93mUpscale Guiding ratio: {self._cache.guiding_ratio}\033[0m")
-            else:
-                self._cache.guiding_ratio = 0.0
-
-            shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = self.adaLN_modulation(c).chunk(6, dim=1)
-
-            x_a = t2i_modulate(self.norm1(x), shift_msa, scale_msa)
-            m_a, _, u_a, _ = compute_merge(x_a, self._tome_info, self._cache)
-
-            m_x_a, size = merge.merge_wavg(m_a, x_a, self._tome_info['args']['proportional_attention']) # return merged x, size
-            x = x + gate_msa.unsqueeze(1) * u_a(self.attn(m_x_a, size))
-
-            x_m = t2i_modulate(self.norm2(x), shift_mlp, scale_mlp)
-            x = x + gate_mlp.unsqueeze(1) * self.mlp(x_m)
-
-            self._cache.step += 1
-            return x
-
-    return PatchedGuidingBlock
-
-
-def patch_tome_blocks(model: torch.nn.Module, start_indices: list[int], num_blocks: list[int], upscale_guiding=False):
+def patch_tome_blocks(model: torch.nn.Module, start_indices: list[int], num_blocks: list[int]):
     index = 0
     block_ranges = []
 
@@ -269,13 +194,8 @@ def patch_tome_blocks(model: torch.nn.Module, start_indices: list[int], num_bloc
     for name, module in model.named_modules():
         if isinstance_str(module, "PixArtMSBlock") or isinstance_str(module, "BasicTransformerBlock"):
             index += 1
-            if not upscale_guiding:
-                if index in block_ranges:
-                    yield module, index
-            else:
-                if index not in block_ranges:
-                    attn = module.attn
-                    yield module, attn, index
+            if index in block_ranges:
+                yield module, index
 
 
 def generate_semi_random_indices(sy: int, sx: int, h: int, w: int, steps: int) -> torch.Tensor:
@@ -313,8 +233,7 @@ def reset_cache(pipeline: torch.nn.Module):
     model._bus = CacheBus()
     for _, module in model.named_modules():
         if (isinstance_str(module, "PatchedPixArtMSBlock")
-                or isinstance_str(module, "PatchedBasicTransformerBlock")
-                or isinstance_str(module, "PatchedGuidingBlock")):
+                or isinstance_str(module, "PatchedBasicTransformerBlock")):
             index = module._cache.index
             module._cache = Cache(index=index, cache_bus=model._bus)
             logging.debug(f"\033[96mCache Reset\033[0m: for index: \033[91m{index}\033[0m")
@@ -336,16 +255,12 @@ def apply_patch(
         latent_size: int = 32,
 
         # == Cache Merge ablation arguments == #
-        semi_rand_schedule: bool = False,
         unmerge_residual: bool = False,
+        cache_step: tuple[int] = (4, 15),
         push_unmerged: bool = False,
 
         # == Hybrid Merging == #
         hybrid_unmerge: float = 0.0,
-
-        # == Branch Feature == #
-        upscale_guiding: int = 0,
-        proportional_attention: bool = False
 ):
 
     # == merging preparation ==
@@ -362,10 +277,6 @@ def apply_patch(
 
     if hybrid_unmerge > 0.0:
         unmerge_residual = True # just an enforcement
-        semi_rand_schedule = True
-
-    if not upscale_guiding:
-        proportional_attention = False
 
     # Ensure provided model is PixArtMS
     is_diffusers = isinstance_str(model, "PixArtTransformer2DModel")
@@ -385,12 +296,10 @@ def apply_patch(
         f"use_rand: {use_rand}\n"
         f"merge_mlp: {merge_mlp}\n"
         f"latent_size: {latent_size}\n"
-        f"semi_rand_schedule: {semi_rand_schedule}\n"
         f"unmerge_residual: {unmerge_residual}\n"
         f"push_unmerged: {push_unmerged}\n"
+        f"cache_steps: {cache_step[0], cache_step[-1]}\n"
         f"hybrid_unmerge: {hybrid_unmerge > 0.0}\n"
-        f"upscale_guiding: {upscale_guiding > 0}\n"
-        f"proportional_attention: {proportional_attention}"
         f"\033[0m"
     )
 
@@ -414,18 +323,14 @@ def apply_patch(
             "latent_size": latent_size,
 
             # == Cache Merge ablation arguments == #
-            "semi_rand_schedule" : semi_rand_schedule,
             "unmerge_residual" : unmerge_residual,
             "push_unmerged": push_unmerged,
+            "cache_start": cache_step[0],
+            "cache_end": cache_step[-1],
 
             # == Hybrid Unmerge == #
             "hybrid_unmerge": True if hybrid_unmerge > 0.0 else False,
             "hybrid_threshold": hybrid_unmerge if hybrid_unmerge > 0.0 else 0.0,
-
-            # == Upscale Guiding == #
-            "upscale_guiding": True if upscale_guiding > 0 else False,
-            "upscale_disable_after": upscale_guiding if upscale_guiding > 0 else 0,
-            "proportional_attention": proportional_attention
         }
     }
 
@@ -439,16 +344,6 @@ def apply_patch(
 
         module._cache = Cache(index=index, cache_bus=model._bus)
         logging.debug(f'Applied token merging patch at Block {index}')
-
-    # Patch Guiding Blocks (Warning: Deprecated)
-    if model._tome_info['args']['upscale_guiding']:
-        for module, attn, index in patch_tome_blocks(model, start_indices, num_blocks, upscale_guiding=True):
-            module.__class__ = make_guiding_block(module.__class__)
-            attn.__class__ = make_guiding_attention(attn.__class__)
-            module._tome_info = model._tome_info
-
-            module._cache = Cache(index=index, cache_bus=model._bus)
-            logging.debug('Applied upscale guidance patch at Block %d', index)
 
     return model
 
