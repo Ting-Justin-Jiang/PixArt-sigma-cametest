@@ -5,6 +5,8 @@ Improved Token Merging for Diffusion Transformer
 DEBUG_MODE: bool = True
 import torch
 import logging
+import xformers.ops
+
 from . import merge
 from .utils import isinstance_str, init_generator
 from typing import Optional, Type, Dict, Any, Tuple, Callable
@@ -15,6 +17,10 @@ class CacheBus:
     """A Bus class for overall control."""
     def __init__(self):
         self.rand_indices = {}  # key: index, value: rand_idx
+
+        self.proj_cached_metrics = {}
+        self.temporal_scores = {}
+
 
 class Cache:
     def __init__(self, index: int, cache_bus: CacheBus):
@@ -42,9 +48,6 @@ class Cache:
 
 def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any], cache: Cache) -> Tuple[Callable, ...]:
     args = tome_info["args"]
-    # x is ([2 * bs, 256, 1152]) if 256 model
-    # x is ([2 * bs, 1024, 1152]) if 512 model
-    # x is ([2 * bs, 16384, 1152]) if 2048 model
     h, w = tome_info["size"]
     r = int(x.shape[1] * args["ratio"])
 
@@ -79,6 +82,92 @@ def compute_merge(x: torch.Tensor, tome_info: Dict[str, Any], cache: Cache) -> T
     return m_a, m_m, u_a, u_m
 
 
+########################################################################################################################
+# = k based = #
+########################################################################################################################
+def make_tome_attention(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
+    class PatchedAttentionKVCompress(block_class):
+        _parent = block_class
+
+        def forward(self, x, mask=None, HW=None, block_id=None):
+            B, N, C = x.shape
+
+            qkv = self.qkv(x).reshape(B, N, 3, C)
+            q, k, v = qkv.unbind(2)
+            dtype = q.dtype
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
+            if self._tome_info['args']['temporal_score'] and self._cache.index - 1 in self._cache.cache_bus.proj_cached_metrics:
+                # todo: fix
+
+                # Computes similarity of k(I+1)(t-1) with K(cached(I+1)(t-1)), where cached(I+1)(t-1) approximates x(I+1)(t)
+                with torch.no_grad():
+                    # Retrieve k(I+1)(t-1) ~ k(I+1)(t)
+                    k_metric = k.clone()
+                    k_metric = k_metric / k_metric.norm(dim=-1, keepdim=True)
+
+                    # Retrieve K(cached(I+1)(t-1))
+                    cached_qkv = self.qkv(self._cache.cache_bus.proj_cached_metrics[self._cache.index-1]).reshape(B, N, 3, C)
+                    _, cached_k_metric, _ = cached_qkv.unbind(2)
+                    cached_k_metric = cached_k_metric / cached_k_metric.norm(dim=-1, keepdim=True)
+
+                    # Pipeline: free up memory
+                    self._cache.cache_bus.proj_cached_metrics[self._cache.index - 1] = None
+
+                    temporal_score = k_metric @ cached_k_metric.transpose(-1, -2)
+                    temporal_score = temporal_score.diagonal(dim1=-2, dim2=-1)  # Get diagonal elements which correspond to the similarity of each index
+
+                    logging.debug(f"Temporal similarity mean: {temporal_score.mean(dim=1)}")
+                    logging.debug(f"Temporal similarity max: {temporal_score.max(dim=1)[0]}")
+
+                    # Pipeline: save to I (last) cache
+                    self._cache.cache_bus.temporal_scores[self._cache.index - 1] = temporal_score
+
+                    del k_metric, cached_qkv, cached_k_metric
+
+
+            # Compute merge
+            m_a, _, u_a, _ = compute_merge(k, self._tome_info, self._cache)
+            q, k, v = m_a(q), m_a(k), m_a(v)
+            new_N = q.shape[1]
+
+            q = q.reshape(B, new_N, self.num_heads, C // self.num_heads).to(dtype)
+            k = k.reshape(B, new_N, self.num_heads, C // self.num_heads).to(dtype)
+            v = v.reshape(B, new_N, self.num_heads, C // self.num_heads).to(dtype)
+
+            attn_bias = None
+            if mask is not None:
+                attn_bias = torch.zeros([B * self.num_heads, q.shape[1], k.shape[1]], dtype=q.dtype, device=q.device)
+                attn_bias.masked_fill_(mask.squeeze(1).repeat(self.num_heads, 1, 1) == 0, float('-inf'))
+            x = xformers.ops.memory_efficient_attention(q, k, v, p=self.attn_drop.p, attn_bias=attn_bias)
+
+            x = x.view(B, new_N, C)
+
+            # Unmerge. Cache at index is updated
+            x = u_a(x)
+
+            x = self.proj(x)
+            x = self.proj_drop(x)
+
+            self._cache.step += 1
+
+            if self._tome_info['args']['temporal_score'] and self._cache.step >= self._tome_info['args']['cache_start']:
+                # todo: fix
+
+                cached_metric = self._cache.feature_map.clone()
+                cached_metric = self.proj_drop(self.proj(cached_metric))
+                self._cache.cache_bus.proj_cached_metrics[self._cache.index] = cached_metric
+                del cached_metric
+
+            return x
+
+    return PatchedAttentionKVCompress
+
+
+########################################################################################################################
+# = x based = #
+########################################################################################################################
 def make_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Module]:
     class PatchedPixArtMSBlock(block_class):
         _parent = block_class
@@ -183,7 +272,7 @@ def make_diffusers_tome_block(block_class: Type[torch.nn.Module]) -> Type[torch.
     return PatchedBasicTransformerBlock
 
 
-def patch_tome_blocks(model: torch.nn.Module, start_indices: list[int], num_blocks: list[int]):
+def patch_tome_blocks(model: torch.nn.Module, start_indices: list[int], num_blocks: list[int], merge_metric: str):
     index = 0
     block_ranges = []
 
@@ -195,7 +284,14 @@ def patch_tome_blocks(model: torch.nn.Module, start_indices: list[int], num_bloc
         if isinstance_str(module, "PixArtMSBlock") or isinstance_str(module, "BasicTransformerBlock"):
             index += 1
             if index in block_ranges:
-                yield module, index
+                if merge_metric == 'x':
+                    yield module, index
+                elif merge_metric == 'k':
+                    attn_module = getattr(module, 'attn', None) or getattr(module, 'attn1', None)
+                    cross_attn_module = getattr(module, 'cross_attn', None) or getattr(module, 'attn2', None)
+                    yield attn_module, index
+                else:
+                    raise ValueError
 
 
 def generate_semi_random_indices(sy: int, sx: int, h: int, w: int, steps: int) -> torch.Tensor:
@@ -233,7 +329,9 @@ def reset_cache(pipeline: torch.nn.Module):
     model._bus = CacheBus()
     for _, module in model.named_modules():
         if (isinstance_str(module, "PatchedPixArtMSBlock")
-                or isinstance_str(module, "PatchedBasicTransformerBlock")):
+            or isinstance_str(module, "PatchedBasicTransformerBlock")
+            or isinstance_str(module, "PatchedAttentionKVCompress")
+        ):
             index = module._cache.index
             module._cache = Cache(index=index, cache_bus=model._bus)
             logging.debug(f"\033[96mCache Reset\033[0m: for index: \033[91m{index}\033[0m")
@@ -261,6 +359,12 @@ def apply_patch(
 
         # == Hybrid Merging == #
         hybrid_unmerge: float = 0.0,
+
+        # == Merge Metric == #
+        merge_metric: str = 'x',
+
+        # == Temporal Score == #
+        temporal_score: bool = False
 ):
 
     # == merging preparation ==
@@ -277,6 +381,8 @@ def apply_patch(
 
     if hybrid_unmerge > 0.0:
         unmerge_residual = True # just an enforcement
+
+    cache_start = max(cache_step[0], 1) # another enforcement, make sure the first step is token merging to avoid cache access
 
     # Ensure provided model is PixArtMS
     is_diffusers = isinstance_str(model, "PixArtTransformer2DModel")
@@ -298,8 +404,10 @@ def apply_patch(
         f"latent_size: {latent_size}\n"
         f"unmerge_residual: {unmerge_residual}\n"
         f"push_unmerged: {push_unmerged}\n"
-        f"cache_steps: {cache_step[0], cache_step[-1]}\n"
+        f"cache_steps: {cache_start, cache_step[-1]}\n"
         f"hybrid_unmerge: {hybrid_unmerge > 0.0}\n"
+        f"merge_metric: {merge_metric}\n",
+        f"temporal_score: {temporal_score}\n",
         f"\033[0m"
     )
 
@@ -325,20 +433,32 @@ def apply_patch(
             # == Cache Merge ablation arguments == #
             "unmerge_residual" : unmerge_residual,
             "push_unmerged": push_unmerged,
-            "cache_start": cache_step[0],
+            "cache_start": cache_start,
             "cache_end": cache_step[-1],
 
             # == Hybrid Unmerge == #
             "hybrid_unmerge": True if hybrid_unmerge > 0.0 else False,
             "hybrid_threshold": hybrid_unmerge if hybrid_unmerge > 0.0 else 0.0,
+
+            # == Merge Metric == #
+            "merge_metric": merge_metric,
+
+            # == Temporal Score == #
+            "temporal_score": temporal_score
         }
     }
 
     model._bus = CacheBus()
 
     # Patch PixArtMS Blocks
-    for module, index in patch_tome_blocks(model, start_indices, num_blocks):
-        make_tome_block_fn = make_diffusers_tome_block if is_diffusers else make_tome_block
+    for module, index in patch_tome_blocks(model, start_indices, num_blocks, merge_metric):
+        if merge_metric == 'x':
+            make_tome_block_fn = make_diffusers_tome_block if is_diffusers else make_tome_block
+        elif merge_metric == 'k':
+            make_tome_block_fn = make_tome_attention
+        else:
+            raise ValueError(f'"{merge_metric}" is not a legal metric')
+
         module.__class__ = make_tome_block_fn(module.__class__)
         module._tome_info = model._tome_info
 

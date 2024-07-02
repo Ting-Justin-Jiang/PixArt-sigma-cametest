@@ -86,27 +86,37 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
         # Find the most similar greedily
         node_max, node_idx = spatial_scores.max(dim=-1)
 
-        if tome_info['args']['unmerge_residual'] and tome_info['args']['cache_start'] <= cache.step <= tome_info['args']['cache_end']:
-            # # deprecated
-            # Normalize the cached feature map
-            cached_metric = cache.feature_map / cache.feature_map.norm(dim=-1, keepdim=True)
+        # if tome_info['args']['temporal_score'] and tome_info['args']['cache_start'] <= cache.step <= tome_info['args']['cache_end']:
+        # todo: fix
 
-            # Retrieve node_idx calculated from both tensors
-            metric_max = gather(metric, dim=1, index=node_idx.unsqueeze(-1).expand(B, N - num_dst, metric.shape[-1]))
-            cached_max = gather(cached_metric, dim=1, index=node_idx.unsqueeze(-1).expand(B, N - num_dst, metric.shape[-1]))
-
-            # # Calculate cosine similarity (Deprecated)
-            temporal_score = metric_max @ cached_max.transpose(-1, -2)
-            temporal_score = temporal_score.diagonal(dim1=-2, dim2=-1) # Get diagonal elements which correspond to the similarity of each index
-
-            # # Calculate MSE
-            # temporal_score = torch.mean((metric_max - cached_max) ** 2, dim=-1)
-
-            logging.debug(f"Temporal similarity mean: {temporal_score.mean(dim=1)}")
-            logging.debug(f"Temporal similarity max: {temporal_score.max(dim=1)[0]}")
-
-            node_max = node_max + temporal_score
-            del cached_metric, metric_max, cached_max
+        #     if cache.index in cache.cache_bus.k_metrics:
+        #         # cached_metric: cached feature map (I+1) (t-1), k_metric: k feature map (I+1) (t-1)
+        #
+        #         k_metric = cache.cache_bus.k_metrics[cache.index]
+        #         k_metric = k_metric / k_metric.norm(dim=-1, keepdim=True)
+        #
+        #         cached_metric = cache.feature_map
+        #         cached_metric = cached_metric / cached_metric.norm(dim=-1, keepdim=True)
+        #
+        #         # Retrieve node_idx calculated from both tensors
+        #         metric_max = gather(k_metric, dim=1, index=node_idx.unsqueeze(-1).expand(B, N - num_dst, metric.shape[-1]))
+        #         cached_max = gather(cached_metric, dim=1, index=node_idx.unsqueeze(-1).expand(B, N - num_dst, metric.shape[-1]))
+        #
+        #         # # Calculate cosine similarity
+        #         temporal_score = metric_max @ cached_max.transpose(-1, -2)
+        #         temporal_score = temporal_score.diagonal(dim1=-2, dim2=-1) # Get diagonal elements which correspond to the similarity of each index
+        #
+        #         # # Calculate MSE
+        #         # temporal_score = - torch.mean((metric_max - cached_max) ** 2, dim=-1)
+        #
+        #         # # Calculate euclidean disatance
+        #         # temporal_score = - torch.cdist(metric_max, cached_max, p=2).diagonal(dim1=-2, dim2=-1)
+        #
+        #         logging.debug(f"Temporal similarity mean: {temporal_score.mean(dim=1)}")
+        #         logging.debug(f"Temporal similarity max: {temporal_score.max(dim=1)[0]}")
+        #
+        #         node_max = node_max + temporal_score
+        #         del cached_metric, metric_max, cached_max
 
 
         edge_idx = node_max.argsort(dim=-1, descending=True)[..., None]
@@ -189,7 +199,7 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
 
             src = gather(dst, dim=-2, index=dst_idx.expand(B, r, c))
 
-        # == Combine back to the original shape （Branch 1 SubBranch 2 & Branch 2)
+        # == Combine back to the original shape (Branch 1 SubBranch 2 & Branch 2)
         out = torch.zeros(B, N, c, device=x.device, dtype=x.dtype)
         out.scatter_(dim=-2, index=b_idx.expand(B, num_dst, c), src=dst)
         out.scatter_(dim=-2, index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=unm_idx).expand(B, unm_len, c), src=unm)
