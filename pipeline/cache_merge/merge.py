@@ -85,40 +85,6 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
 
         # Find the most similar greedily
         node_max, node_idx = spatial_scores.max(dim=-1)
-
-        # if tome_info['args']['temporal_score'] and tome_info['args']['cache_start'] <= cache.step <= tome_info['args']['cache_end']:
-        # todo: fix
-
-        #     if cache.index in cache.cache_bus.k_metrics:
-        #         # cached_metric: cached feature map (I+1) (t-1), k_metric: k feature map (I+1) (t-1)
-        #
-        #         k_metric = cache.cache_bus.k_metrics[cache.index]
-        #         k_metric = k_metric / k_metric.norm(dim=-1, keepdim=True)
-        #
-        #         cached_metric = cache.feature_map
-        #         cached_metric = cached_metric / cached_metric.norm(dim=-1, keepdim=True)
-        #
-        #         # Retrieve node_idx calculated from both tensors
-        #         metric_max = gather(k_metric, dim=1, index=node_idx.unsqueeze(-1).expand(B, N - num_dst, metric.shape[-1]))
-        #         cached_max = gather(cached_metric, dim=1, index=node_idx.unsqueeze(-1).expand(B, N - num_dst, metric.shape[-1]))
-        #
-        #         # # Calculate cosine similarity
-        #         temporal_score = metric_max @ cached_max.transpose(-1, -2)
-        #         temporal_score = temporal_score.diagonal(dim1=-2, dim2=-1) # Get diagonal elements which correspond to the similarity of each index
-        #
-        #         # # Calculate MSE
-        #         # temporal_score = - torch.mean((metric_max - cached_max) ** 2, dim=-1)
-        #
-        #         # # Calculate euclidean disatance
-        #         # temporal_score = - torch.cdist(metric_max, cached_max, p=2).diagonal(dim1=-2, dim2=-1)
-        #
-        #         logging.debug(f"Temporal similarity mean: {temporal_score.mean(dim=1)}")
-        #         logging.debug(f"Temporal similarity max: {temporal_score.max(dim=1)[0]}")
-        #
-        #         node_max = node_max + temporal_score
-        #         del cached_metric, metric_max, cached_max
-
-
         edge_idx = node_max.argsort(dim=-1, descending=True)[..., None]
 
         unm_idx = edge_idx[..., r:, :]  # Unmerged Tokens

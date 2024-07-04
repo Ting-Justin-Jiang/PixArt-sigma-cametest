@@ -59,13 +59,12 @@ def get_args():
     parser.add_argument("--num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[9, 3])
 
     # == Improvements == #
-    parser.add_argument("--unmerge-residual", action=argparse.BooleanOptionalAction, type=bool, default=False)
-    parser.add_argument("--cache-step", type=lambda s: (int(item) for item in s.split(',')), default=(4, 15))
-    parser.add_argument("--push-unmerged", action=argparse.BooleanOptionalAction, type=bool, default=False)
+    parser.add_argument("--unmerge-residual", action=argparse.BooleanOptionalAction, type=bool, default=True)
+    parser.add_argument("--cache-step", type=lambda s: (int(item) for item in s.split(',')), default=(4, 16))
+    parser.add_argument("--push-unmerged", action=argparse.BooleanOptionalAction, type=bool, default=True)
 
     # == Hybrid Unmerge (Deprecated) == #
-    parser.add_argument("--hybrid-unmerge", type=float, default=0.0,
-                        help="cosine similarity threshold, set 0.0 to bypass")
+    parser.add_argument("--hybrid-unmerge", type=float, default=0.0, help="cosine similarity threshold, set 0.0 to bypass")
 
     # == New Feature == #
     parser.add_argument("--merge-metric", type=str, choices=["k", "x"], default="k")

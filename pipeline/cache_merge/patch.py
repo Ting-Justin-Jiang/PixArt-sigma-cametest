@@ -2,7 +2,7 @@
 Code adapted from original tomesd: https://github.com/dbolya/tomesd
 Improved Token Merging for Diffusion Transformer
 """
-DEBUG_MODE: bool = True
+DEBUG_MODE: bool = False
 import torch
 import logging
 import xformers.ops
@@ -17,8 +17,6 @@ class CacheBus:
     """A Bus class for overall control."""
     def __init__(self):
         self.rand_indices = {}  # key: index, value: rand_idx
-
-        self.proj_cached_metrics = {}
         self.temporal_scores = {}
 
 
@@ -98,35 +96,6 @@ def make_tome_attention(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Mod
             q = self.q_norm(q)
             k = self.k_norm(k)
 
-            if self._tome_info['args']['temporal_score'] and self._cache.index - 1 in self._cache.cache_bus.proj_cached_metrics:
-                # todo: fix
-
-                # Computes similarity of k(I+1)(t-1) with K(cached(I+1)(t-1)), where cached(I+1)(t-1) approximates x(I+1)(t)
-                with torch.no_grad():
-                    # Retrieve k(I+1)(t-1) ~ k(I+1)(t)
-                    k_metric = k.clone()
-                    k_metric = k_metric / k_metric.norm(dim=-1, keepdim=True)
-
-                    # Retrieve K(cached(I+1)(t-1))
-                    cached_qkv = self.qkv(self._cache.cache_bus.proj_cached_metrics[self._cache.index-1]).reshape(B, N, 3, C)
-                    _, cached_k_metric, _ = cached_qkv.unbind(2)
-                    cached_k_metric = cached_k_metric / cached_k_metric.norm(dim=-1, keepdim=True)
-
-                    # Pipeline: free up memory
-                    self._cache.cache_bus.proj_cached_metrics[self._cache.index - 1] = None
-
-                    temporal_score = k_metric @ cached_k_metric.transpose(-1, -2)
-                    temporal_score = temporal_score.diagonal(dim1=-2, dim2=-1)  # Get diagonal elements which correspond to the similarity of each index
-
-                    logging.debug(f"Temporal similarity mean: {temporal_score.mean(dim=1)}")
-                    logging.debug(f"Temporal similarity max: {temporal_score.max(dim=1)[0]}")
-
-                    # Pipeline: save to I (last) cache
-                    self._cache.cache_bus.temporal_scores[self._cache.index - 1] = temporal_score
-
-                    del k_metric, cached_qkv, cached_k_metric
-
-
             # Compute merge
             m_a, _, u_a, _ = compute_merge(k, self._tome_info, self._cache)
             q, k, v = m_a(q), m_a(k), m_a(v)
@@ -147,18 +116,23 @@ def make_tome_attention(block_class: Type[torch.nn.Module]) -> Type[torch.nn.Mod
             # Unmerge. Cache at index is updated
             x = u_a(x)
 
-            x = self.proj(x)
-            x = self.proj_drop(x)
-
             self._cache.step += 1
 
-            if self._tome_info['args']['temporal_score'] and self._cache.step >= self._tome_info['args']['cache_start']:
-                # todo: fix
+            if self._tome_info['args']['temporal_score']:
+                if self._tome_info['args']['cache_start'] <= self._cache.step:
+                    _, K_x, _ = self.qkv(x.clone()).reshape(B, N, 3, C).unbind(2)
 
-                cached_metric = self._cache.feature_map.clone()
-                cached_metric = self.proj_drop(self.proj(cached_metric))
-                self._cache.cache_bus.proj_cached_metrics[self._cache.index] = cached_metric
-                del cached_metric
+                    cached = self._cache.feature_map.clone()
+                    _, K_cached, _ = self.qkv(cached).reshape(B, N, 3, C).unbind(2)
+
+                    temporal_score = torch.nn.functional.cosine_similarity(K_x, K_cached, dim=-1)
+
+                    logging.debug(f"\033[96mTemporal similarity\033[0m mean: {temporal_score.mean(dim=1)}")
+                    logging.debug(f"\033[96mTemporal similarity\033[0m max: {temporal_score.max(dim=1)[0]}")
+                    logging.debug(f"\033[96mTemporal similarity\033[0m min: {temporal_score.min(dim=1)[0]}")
+
+            x = self.proj(x)
+            x = self.proj_drop(x)
 
             return x
 
@@ -406,8 +380,8 @@ def apply_patch(
         f"push_unmerged: {push_unmerged}\n"
         f"cache_steps: {cache_start, cache_step[-1]}\n"
         f"hybrid_unmerge: {hybrid_unmerge > 0.0}\n"
-        f"merge_metric: {merge_metric}\n",
-        f"temporal_score: {temporal_score}\n",
+        f"merge_metric: {merge_metric}\n"
+        f"temporal_score: {temporal_score}\n"
         f"\033[0m"
     )
 
