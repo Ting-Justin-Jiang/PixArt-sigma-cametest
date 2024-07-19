@@ -46,35 +46,40 @@ def get_args():
     parser.add_argument('--sdvae', action='store_true', help='sd vae')
 
     # == Sampling configuration == #
-    parser.add_argument('--seed', default=42, type=int, help='Seed for the random generator')
+    parser.add_argument('--seed', default=256, type=int, help='Seed for the random generator')
     parser.add_argument('--sampler', default='dpm-solver', type=str, choices=['iddpm', 'dpm-solver', 'sa-solver'])
     parser.add_argument('--sample_steps', default=20, type=int, help='Number of inference steps')
     parser.add_argument('--guidance_scale', default=7.0, type=float, help='Guidance scale')
 
     # ==== ==== ==== ==== ==== ==== ==== ==== ==== #
-    # ==== Token Merging Configuration ==== #
+    # ==== Acceleration Patch ==== #
     parser.add_argument('--experiment-folder', type=str, default='samples/experiment/broadcast')
-    parser.add_argument("--merge-ratio", type=float, default=0.4, help="Ratio of tokens to merge")
-    parser.add_argument("--start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[8, 21, 26])
-    parser.add_argument("--num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[9, 3, 2])
 
-    # == Improvements == #
-    parser.add_argument("--unmerge-residual", action=argparse.BooleanOptionalAction, type=bool, default=True)
+    # ==== 1. Merging ==== #
+    parser.add_argument("--merge-ratio", type=float, default=0.4, help="Ratio of tokens to merge")
+    parser.add_argument("--merge-metric", type=str, choices=["k", "x"], default="k")
+
+    # == 1.1 Token Merging (Spatial) == #
+    parser.add_argument("--start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[21, 26])
+    parser.add_argument("--num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[3, 2])
+
+    # == 1.2 Cache Merging (Spatial-Temporal) == #
+    parser.add_argument("--cache-start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[8])
+    parser.add_argument("--cache-num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[9])
     parser.add_argument("--cache-step", type=lambda s: (int(item) for item in s.split(',')), default=(4, 15))
     parser.add_argument("--push-unmerged", action=argparse.BooleanOptionalAction, type=bool, default=True)
 
-    # == Hybrid Unmerge (Deprecated) == #
+    # == 1.2.1 Hybrid Unmerge (Deprecated) == #
     parser.add_argument("--hybrid-unmerge", type=float, default=0.0, help="cosine similarity threshold, set 0.0 to bypass")
 
-    # == New Feature == #
-    parser.add_argument("--merge-metric", type=str, choices=["k", "x"], default="k")
-    parser.add_argument("--temporal-score", action=argparse.BooleanOptionalAction, type=bool, default=False)
-
-    # == Broadcast == #
+    # == 2. Broadcast (Temporal) == #
     parser.add_argument("--broadcast-range", type=int, default=2, help="broadcast range, set 0 to bypass")
     parser.add_argument("--broadcast-step", type=lambda s: (int(item) for item in s.split(',')), default=(4, 15))
-    parser.add_argument("--broadcast-start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[1, 17])
-    parser.add_argument("--broadcast-num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[7, 4])
+    parser.add_argument("--broadcast-start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[1])
+    parser.add_argument("--broadcast-num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[7])
+
+    # == Misc == #
+    parser.add_argument("--temporal-score", action=argparse.BooleanOptionalAction, type=bool, default=False)
 
     return parser.parse_args()
 
@@ -214,24 +219,25 @@ if __name__ == '__main__':
 
     if args.merge_ratio > 0.0:
         model = patch.apply_patch(model,
-                                 start_indices=args.start_indices,
-                                 num_blocks=args.num_blocks,
-                                 ratio=args.merge_ratio,
-                                 sx=1, sy=3, latent_size=latent_size,
+                                  merge_metric=args.merge_metric,
+                                  ratio=args.merge_ratio,
+                                  sx=1, sy=3, latent_size=latent_size,
 
-                                 unmerge_residual=args.unmerge_residual,
-                                 cache_step=args.cache_step,
-                                 push_unmerged=args.push_unmerged,
+                                  start_indices=args.start_indices,
+                                  num_blocks=args.num_blocks,
 
-                                 hybrid_unmerge=args.hybrid_unmerge,
+                                  cache_start_indices=args.cache_start_indices,
+                                  cache_num_blocks=args.cache_num_blocks,
+                                  cache_step=args.cache_step,
+                                  push_unmerged=args.push_unmerged,
 
-                                 merge_metric=args.merge_metric,
-                                 temporal_score=args.temporal_score,
+                                  broadcast_range=args.broadcast_range,
+                                  broadcast_step=args.broadcast_step,
+                                  broadcast_start_indices=args.broadcast_start_indices,
+                                  broadcast_num_blocks=args.broadcast_num_blocks,
 
-                                 broadcast_range=args.broadcast_range,
-                                 broadcast_step=args.broadcast_step,
-                                 broadcast_start_indices=args.broadcast_start_indices,
-                                 broadcast_num_blocks=args.broadcast_num_blocks)
+                                  hybrid_unmerge=args.hybrid_unmerge,
+                                  temporal_score=args.temporal_score)
 
     model.eval()
     base_ratios = eval(f'ASPECT_RATIO_{args.image_size}_TEST')
@@ -262,16 +268,7 @@ if __name__ == '__main__':
 
     # Save and display images:
     if args.merge_ratio > 0.0:
-        if args.hybrid_unmerge > 0.0:
-            save_path = (
-                f"{args.experiment_folder}/hybrid_unmerge-{args.merge_ratio}-{args.start_indices}-threshold-{args.hybrid_unmerge}-"
-                f"push_unmerged-{args.push_unmerged}.png")
-        else:
-            if args.unmerge_residual:
-                save_path = (f"{args.experiment_folder}/cache_unmerge-{args.merge_ratio}-{args.start_indices}-"
-                             f"push_unmerged-{args.push_unmerged}.png")
-            else:
-                save_path = f"{args.experiment_folder}/token_unmerge-{args.merge_ratio}-{args.start_indices}.png"
+        save_path = f"{args.experiment_folder}/{args.merge_metric}_merge-{args.merge_ratio}-token_{args.start_indices}-cache_{args.cache_start_indices}-broadcast_{args.broadcast_range}_{args.broadcast_start_indices}.png"
     else:
         save_path = f"{args.experiment_folder}/no-merge.png"
 

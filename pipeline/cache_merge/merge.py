@@ -24,6 +24,7 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
                                      tome_info: dict,
                                      no_rand: bool = False,
                                      generator: torch.Generator = None,
+                                     unmerge_mode: str = 'token_merge',
                                      cache: any = None,
                                      rand_indices: torch.Tensor = None) -> Tuple[Callable, Callable]:
     B, N, _ = metric.shape
@@ -40,7 +41,7 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
         if no_rand:
             rand_idx = torch.zeros(hsy, wsx, 1, device=metric.device, dtype=torch.int64)
         else:
-            if tome_info['args']['unmerge_residual']:
+            if unmerge_mode == 'cache_merge':
                 # retrieve from a pre-defined semi-random schedule
                 rand_idx = rand_indices[cache.step].to(generator.device)
             else:
@@ -120,7 +121,7 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
         unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
         _, _, c = unm.shape
 
-        if tome_info['args']['unmerge_residual'] and tome_info['args']['cache_start'] <= cache.step <= tome_info['args']['cache_end']:
+        if unmerge_mode == 'cache_merge' and tome_info['args']['cache_start'] <= cache.step <= tome_info['args']['cache_end']:
             # == Branch 1: Improved Merging middle steps
             # Only proceed improved unmerging mechanism during middle steps
 
@@ -158,7 +159,7 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
         else:
             # == Branch 2: Token Merging & Improved Merging first/last steps
             # Proceed vanilla token unmerging, while updating the cache if cache unmerging is enabled
-            if tome_info['args']['unmerge_residual'] and cache.feature_map is not None:
+            if unmerge_mode == 'cache_merge' and cache.feature_map is not None:
                 cache.push(dst, index=b_idx.expand(B, num_dst, c))
                 if tome_info['args']['push_unmerged']:
                     cache.push(unm, index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=unm_idx).expand(B, unm_len, c))
@@ -172,7 +173,7 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
         out.scatter_(dim=-2, index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=src_idx).expand(B, r, c), src=src)
 
         # For the first step
-        if tome_info['args']['unmerge_residual'] and cache.feature_map is None:
+        if unmerge_mode == 'cache_merge' and cache.feature_map is None:
             cache.push(out)
 
         return out

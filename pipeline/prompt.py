@@ -1,20 +1,22 @@
 PROMPT = [
-    "3D animation of a small, round, fluffy creature with big, expressive eyes explores a vibrant, enchanted forest. "
-    "The creature, a whimsical blend of a rabbit and a squirrel, has soft blue fur and a bushy, striped tail. "
-    "It hops along a sparkling stream, its eyes wide with wonder. Flowers that glow and change colors, "
-    "trees with leaves in shades of purple and silver, and small floating lights that resemble fireflies. "
-    "The creature stops to interact playfully with a group of tiny, fairy-like beings dancing around a mushroom ring.",
+    "Kyoto Animation stylized anime mixed with tradition Chinese artworks. A girl at modern cyberpunk city with a Chinese dragon "
+    "Cinematic Lighting, ethereal light, intricate details, extremely detailed, incredible details, full colored, "
+    "complex details, insanely detailed and intricate, hypermaximalist, extremely detailed with rich colors. "
+    "masterpiece, best quality, aerial view, HDR, UHD, unreal engine. plump looking at the camera, smooth thighs, "
+    "(glittery jewelry) ((acrylic illustration, by artgerm, by kawacy, by John Singer Sargenti) dark Fantasy background, "
+    "glittery jewelry, Representative, fair skin, beautiful face, Rich in details High quality, gorgeous, glamorous, 8k, "
+    "super detail, gorgeous light and shadow, detailed decoration, detailed lines",
 
-    "Professional gouache painting of beautiful young (realistic) anime girl, ringlet hair, "
-    "beautiful gouache portrait by Ross Tran, by Artgerm, by Atey Ghailan, by Loish, by James Jean, "
-    "trending on ArtStation, trending on Pixiv, Pixiv, ピクシブ, 少女, 女性, volumetric lighting, dramatic lighting, "
-    "Disney, alien vegetation",
+    "an anthropomorphic cat wearing white linen is depicted in an action pose, swirling water with an arrow symbol in "
+    "cat hand, floating above a street in a dark city alleyway, swirling magic effects and swirling energy waves surround "
+    "cat, with a blue glow on cat face and body, looking at the camera, hyper detailed, movie still, ultrawide",
 
-    "teenager playing computer games in his cozy bedroom with a big window beside him at night, outside his window "
-    "is a cyberpunk city, cyberpunk city, night time, as seen from a window, neon lights, photo-realistic, "
-    "ultra detailed, ultra-wide, volumetric lighting, cinematic, photorealistic, 16k HDR rendering, vfx, ultra realistic, "
-    "8k, cinematic purple lightning, hyper realistic",
+    "A little girl with short hair and wearing a red wool coat stands in front of a door, with autumn leaves falling all"
+    " around her, flowers on the ground, trees, doors, and windows, creating an atmosphere filled with warm colors. "
+    "In the style of Pixar, with high definition, detailed depiction, wide-angle lens, soft lighting, "
+    "static movements, lively expressions, and cheerful emotions ",
 
-    "Isometric style Fortress from RPG game, unreal engine, masterpiece 3D rendering, vibrant, beautiful, crisp, detailed, ultra detailed, intricate."
-    "A dragon splitting fire, attacking the fortress with soldiers in silver medieval armors."
+    "(Best Quality, Masterpiece) , centered, (fantasy theme), front cover of japanese pop manga magazine, concept art, "
+    "design, magazine design, 1girl, cute, orange ponytail hair, backpacker, model pose, (epic composition, epic proportion), "
+    "vibrant color, text, diagrams, advertisements, magazine title, typography,"
 ]
