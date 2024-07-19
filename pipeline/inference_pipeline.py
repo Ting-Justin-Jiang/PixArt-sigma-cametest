@@ -53,14 +53,14 @@ def get_args():
 
     # ==== ==== ==== ==== ==== ==== ==== ==== ==== #
     # ==== Token Merging Configuration ==== #
-    parser.add_argument('--experiment-folder', type=str, default='samples/experiment/inference')
-    parser.add_argument("--merge-ratio", type=float, default=0.6, help="Ratio of tokens to merge")
-    parser.add_argument("--start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[8, 21])
-    parser.add_argument("--num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[9, 3])
+    parser.add_argument('--experiment-folder', type=str, default='samples/experiment/broadcast')
+    parser.add_argument("--merge-ratio", type=float, default=0.4, help="Ratio of tokens to merge")
+    parser.add_argument("--start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[8, 21, 26])
+    parser.add_argument("--num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[9, 3, 2])
 
     # == Improvements == #
     parser.add_argument("--unmerge-residual", action=argparse.BooleanOptionalAction, type=bool, default=True)
-    parser.add_argument("--cache-step", type=lambda s: (int(item) for item in s.split(',')), default=(4, 16))
+    parser.add_argument("--cache-step", type=lambda s: (int(item) for item in s.split(',')), default=(4, 15))
     parser.add_argument("--push-unmerged", action=argparse.BooleanOptionalAction, type=bool, default=True)
 
     # == Hybrid Unmerge (Deprecated) == #
@@ -69,6 +69,12 @@ def get_args():
     # == New Feature == #
     parser.add_argument("--merge-metric", type=str, choices=["k", "x"], default="k")
     parser.add_argument("--temporal-score", action=argparse.BooleanOptionalAction, type=bool, default=False)
+
+    # == Broadcast == #
+    parser.add_argument("--broadcast-range", type=int, default=2, help="broadcast range, set 0 to bypass")
+    parser.add_argument("--broadcast-step", type=lambda s: (int(item) for item in s.split(',')), default=(4, 15))
+    parser.add_argument("--broadcast-start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[1, 17])
+    parser.add_argument("--broadcast-num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[7, 4])
 
     return parser.parse_args()
 
@@ -115,7 +121,6 @@ def generate_img(prompt, sampler, sample_steps, scale, seed=0, randomize_seed=Fa
     latent_size_h, latent_size_w = int(hw[0, 0]//8), int(hw[0, 1]//8)
 
     # Sample images:
-    start = time.time()
     if sampler == 'iddpm':
         # Create sampling noise:
         n = len(prompts)
@@ -123,6 +128,7 @@ def generate_img(prompt, sampler, sample_steps, scale, seed=0, randomize_seed=Fa
         model_kwargs = dict(y=torch.cat([caption_embs, null_y]),
                             cfg_scale=scale, data_info={'img_hw': hw, 'aspect_ratio': ar}, mask=emb_masks)
         diffusion = IDDPM(str(sample_steps))
+        start = time.perf_counter()
         samples = diffusion.p_sample_loop(
             model.forward_with_cfg, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=True,
             device=device
@@ -138,6 +144,7 @@ def generate_img(prompt, sampler, sample_steps, scale, seed=0, randomize_seed=Fa
                           uncondition=null_y,
                           cfg_scale=scale,
                           model_kwargs=model_kwargs)
+        start = time.perf_counter()
         samples = dpm_solver.sample(
             z,
             steps=sample_steps,
@@ -150,6 +157,7 @@ def generate_img(prompt, sampler, sample_steps, scale, seed=0, randomize_seed=Fa
         n = len(prompts)
         model_kwargs = dict(data_info={'img_hw': hw, 'aspect_ratio': ar}, mask=emb_masks)
         sa_solver = SASolverSampler(model.forward_with_dpmsolver, device=device)
+        start = time.perf_counter()
         samples = sa_solver.sample(
             S=sample_steps,
             batch_size=n,
@@ -161,9 +169,10 @@ def generate_img(prompt, sampler, sample_steps, scale, seed=0, randomize_seed=Fa
             model_kwargs=model_kwargs,
         )[0]
 
+    runtime = (time.perf_counter() - start)
+
     samples = samples.to(weight_dtype)
     samples = vae.decode(samples / vae.config.scaling_factor).sample
-    runtime = (time.time() - start)
 
     samples = resize_and_crop_tensor(samples, custom_hw[0,1], custom_hw[0,0])
     return samples.squeeze(0), runtime
@@ -217,7 +226,12 @@ if __name__ == '__main__':
                                  hybrid_unmerge=args.hybrid_unmerge,
 
                                  merge_metric=args.merge_metric,
-                                 temporal_score=args.temporal_score)
+                                 temporal_score=args.temporal_score,
+
+                                 broadcast_range=args.broadcast_range,
+                                 broadcast_step=args.broadcast_step,
+                                 broadcast_start_indices=args.broadcast_start_indices,
+                                 broadcast_num_blocks=args.broadcast_num_blocks)
 
     model.eval()
     base_ratios = eval(f'ASPECT_RATIO_{args.image_size}_TEST')
