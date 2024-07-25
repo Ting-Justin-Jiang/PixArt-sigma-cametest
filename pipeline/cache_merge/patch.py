@@ -138,8 +138,8 @@ def make_tome_attention(block_class: Type[torch.nn.Module], mode: str = 'token_m
             # Unmerge. Cache at index is updated
             x = u_a(x)
 
-            if self._tome_info['args']['temporal_score']: # Deprecated. Might proceed depends on the similarity computation
-                if self._cache.step >= self._tome_info['args']['cache_start'] - 1:
+            if self._tome_info['args']['temporal_score'] and self._mode == 'cache_merge': # Deprecated
+                if self._cache.step >= self._tome_info['args']['cache_start'] - 1:  # cache_start >= 1
                     _, K_x, _ = self.qkv(x.clone()).reshape(B, N, 3, C).unbind(2)
 
                     cached = self._cache.feature_map.clone()
@@ -173,14 +173,14 @@ def make_tome_block(block_class: Type[torch.nn.Module], mode: str = 'token_merge
             shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (self.scale_shift_table[None] + t.reshape(B, 6, -1)).chunk(6, dim=1)
 
             # 1. Self Attention
-            if mode is not 'broadcast':
+            if self._mode == 'token_merge' or self._mode == 'cache_merge':
                 # == Merge == #
                 # compute merge function (before soft-matching) doesn't give large overhead
                 x_a = t2i_modulate(self.norm1(x), shift_msa, scale_msa)
                 m_a, _, u_a, _ = compute_merge(x_a, self._mode, self._tome_info, self._cache)
                 x = x + self.drop_path(gate_msa * u_a(self.attn(m_a(x_a), HW=HW)))
 
-            else:
+            elif self._mode == 'broadcast':
                 # == Broadcast == #
                 if self._tome_info['args']['broadcast_start'] <= self._cache.step <= self._tome_info['args']['broadcast_end']:
                     should_save = self._cache.should_save(self._tome_info['args']['broadcast_start'])
@@ -194,6 +194,9 @@ def make_tome_block(block_class: Type[torch.nn.Module], mode: str = 'token_merge
                 else:
                     # regular operation
                     x = x + self.drop_path(gate_msa * self.attn(t2i_modulate(self.norm1(x), shift_msa, scale_msa), HW=HW))
+
+            else:
+                raise RuntimeError('Invalid accelerating mode')
 
             # 2. Cross Attention
             x = x + self.cross_attn(x, y, mask)
@@ -412,9 +415,10 @@ def apply_patch(
         cache_start = max(cache_step[0], 1) # Make sure the first step is token merging to avoid cache access
     else:
         cache_merge = False
-        cache_start = None
-        cache_step = (None, None)
-        hybrid_unmerge = 0.0
+        cache_start = max(cache_step[0], 1)
+        # cache_start = None
+        # cache_step = (None, None)
+        # hybrid_unmerge = 0.0
 
     if broadcast_range < 1:
         broadcast = False
@@ -559,6 +563,7 @@ def apply_patch(
             logging.debug(f'Applied Broadcast patch at Block {index}')
 
     return model
+
 
 def remove_patch(model: torch.nn.Module):
     for _, module in model.named_modules():

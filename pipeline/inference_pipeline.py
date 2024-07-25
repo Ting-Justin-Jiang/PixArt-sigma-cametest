@@ -30,7 +30,6 @@ from asset.examples import examples
 from diffusion.utils.dist_utils import flush
 
 from prompt import PROMPT
-from torchvision.utils import save_image
 from cache_merge import patch
 
 
@@ -46,27 +45,27 @@ def get_args():
     parser.add_argument('--sdvae', action='store_true', help='sd vae')
 
     # == Sampling configuration == #
-    parser.add_argument('--seed', default=256, type=int, help='Seed for the random generator')
+    parser.add_argument('--seed', default=4096, type=int, help='Seed for the random generator')
     parser.add_argument('--sampler', default='dpm-solver', type=str, choices=['iddpm', 'dpm-solver', 'sa-solver'])
     parser.add_argument('--sample_steps', default=20, type=int, help='Number of inference steps')
-    parser.add_argument('--guidance_scale', default=7.0, type=float, help='Guidance scale')
+    parser.add_argument('--guidance_scale', default=4.5, type=float, help='Guidance scale')
 
     # ==== ==== ==== ==== ==== ==== ==== ==== ==== #
     # ==== Acceleration Patch ==== #
     parser.add_argument('--experiment-folder', type=str, default='samples/experiment/broadcast')
 
     # ==== 1. Merging ==== #
-    parser.add_argument("--merge-ratio", type=float, default=0.4, help="Ratio of tokens to merge")
+    parser.add_argument("--merge-ratio", type=float, default=0.5, help="Ratio of tokens to merge")
     parser.add_argument("--merge-metric", type=str, choices=["k", "x"], default="k")
 
     # == 1.1 Token Merging (Spatial) == #
-    parser.add_argument("--start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[21, 26])
-    parser.add_argument("--num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[3, 2])
+    parser.add_argument("--start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[8, 21])
+    parser.add_argument("--num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[8, 2])
 
     # == 1.2 Cache Merging (Spatial-Temporal) == #
-    parser.add_argument("--cache-start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[8])
-    parser.add_argument("--cache-num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[9])
-    parser.add_argument("--cache-step", type=lambda s: (int(item) for item in s.split(',')), default=(4, 15))
+    parser.add_argument("--cache-start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[])
+    parser.add_argument("--cache-num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[])
+    parser.add_argument("--cache-step", type=lambda s: (int(item) for item in s.split(',')), default=(7, 18))
     parser.add_argument("--push-unmerged", action=argparse.BooleanOptionalAction, type=bool, default=True)
 
     # == 1.2.1 Hybrid Unmerge (Deprecated) == #
@@ -74,9 +73,9 @@ def get_args():
 
     # == 2. Broadcast (Temporal) == #
     parser.add_argument("--broadcast-range", type=int, default=2, help="broadcast range, set 0 to bypass")
-    parser.add_argument("--broadcast-step", type=lambda s: (int(item) for item in s.split(',')), default=(4, 15))
-    parser.add_argument("--broadcast-start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[1])
-    parser.add_argument("--broadcast-num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[7])
+    parser.add_argument("--broadcast-step", type=lambda s: (int(item) for item in s.split(',')), default=(5, 18))
+    parser.add_argument("--broadcast-start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[1, 16, 23])
+    parser.add_argument("--broadcast-num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[7, 5, 6])
 
     # == Misc == #
     parser.add_argument("--temporal-score", action=argparse.BooleanOptionalAction, type=bool, default=False)
