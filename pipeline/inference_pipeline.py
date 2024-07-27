@@ -48,23 +48,24 @@ def get_args():
     parser.add_argument('--seed', default=4096, type=int, help='Seed for the random generator')
     parser.add_argument('--sampler', default='dpm-solver', type=str, choices=['iddpm', 'dpm-solver', 'sa-solver'])
     parser.add_argument('--sample_steps', default=20, type=int, help='Number of inference steps')
-    parser.add_argument('--guidance_scale', default=4.5, type=float, help='Guidance scale')
+    parser.add_argument('--guidance_scale', default=7.0, type=float, help='Guidance scale')
 
     # ==== ==== ==== ==== ==== ==== ==== ==== ==== #
     # ==== Acceleration Patch ==== #
-    parser.add_argument('--experiment-folder', type=str, default='samples/experiment/broadcast')
+    parser.add_argument('--experiment-folder', type=str, default='samples/inference/cfg=7.5')
 
     # ==== 1. Merging ==== #
     parser.add_argument("--merge-ratio", type=float, default=0.5, help="Ratio of tokens to merge")
     parser.add_argument("--merge-metric", type=str, choices=["k", "x"], default="k")
+    parser.add_argument("--merge-cond", action=argparse.BooleanOptionalAction, type=bool, default=False)
 
     # == 1.1 Token Merging (Spatial) == #
-    parser.add_argument("--start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[8, 21])
-    parser.add_argument("--num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[8, 2])
+    parser.add_argument("--start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[])
+    parser.add_argument("--num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[])
 
     # == 1.2 Cache Merging (Spatial-Temporal) == #
-    parser.add_argument("--cache-start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[])
-    parser.add_argument("--cache-num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[])
+    parser.add_argument("--cache-start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[8, 21])
+    parser.add_argument("--cache-num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[8, 2])
     parser.add_argument("--cache-step", type=lambda s: (int(item) for item in s.split(',')), default=(7, 18))
     parser.add_argument("--push-unmerged", action=argparse.BooleanOptionalAction, type=bool, default=True)
 
@@ -220,6 +221,7 @@ if __name__ == '__main__':
         model = patch.apply_patch(model,
                                   merge_metric=args.merge_metric,
                                   ratio=args.merge_ratio,
+                                  merge_cond=args.merge_cond,
                                   sx=1, sy=3, latent_size=latent_size,
 
                                   start_indices=args.start_indices,
@@ -235,8 +237,7 @@ if __name__ == '__main__':
                                   broadcast_start_indices=args.broadcast_start_indices,
                                   broadcast_num_blocks=args.broadcast_num_blocks,
 
-                                  hybrid_unmerge=args.hybrid_unmerge,
-                                  temporal_score=args.temporal_score)
+                                  hybrid_unmerge=args.hybrid_unmerge)
 
     model.eval()
     base_ratios = eval(f'ASPECT_RATIO_{args.image_size}_TEST')

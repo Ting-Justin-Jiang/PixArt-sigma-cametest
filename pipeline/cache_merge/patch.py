@@ -17,13 +17,13 @@ class CacheBus:
     """A Bus class for overall control."""
     def __init__(self):
         self.rand_indices = {}  # key: index, value: rand_idx
-        self.temporal_scores = {}
 
 
 class Cache:
     def __init__(self, index: int, cache_bus: CacheBus, broadcast_range: int = 1):
         self.cache_bus = cache_bus
         self.feature_map = None
+        self.feature_map_broadcast = None
         self.index = index
         self.broadcast_range = broadcast_range
         self.step = 0
@@ -47,13 +47,13 @@ class Cache:
 
     # == 2. Broadcast Operations == #
     def save(self, x: torch.Tensor) -> None:
-        self.feature_map = x.clone()
+        self.feature_map_broadcast = x.clone()
 
     def broadcast(self) -> torch.Tensor:
-        if self.feature_map is None:
+        if self.feature_map_broadcast is None:
             raise RuntimeError
         else:
-            return self.feature_map
+            return self.feature_map_broadcast
 
     def should_save(self, broadcast_start: int) -> bool:
         if (self.step - broadcast_start) % self.broadcast_range == 0:
@@ -75,10 +75,6 @@ def compute_merge(x: torch.Tensor, mode: str, tome_info: Dict[str, Any], cache: 
     elif args["generator"].device != x.device:
         args["generator"] = init_generator(x.device, fallback=args["generator"])
 
-    # If the batch size is odd, then it's not possible for prompted and unprompted images to be in the same
-    # batch, which causes artifacts with use_rand, so force it to be off.
-    use_rand = False if x.shape[0] % 2 == 1 else args["use_rand"]
-
     # retrieve (or create) semi-random merging schedule
     if mode == 'cache_merge':
         if cache.index not in cache.cache_bus.rand_indices:
@@ -92,7 +88,7 @@ def compute_merge(x: torch.Tensor, mode: str, tome_info: Dict[str, Any], cache: 
         rand_indices = None
 
     m, u = merge.bipartite_soft_matching_random2d(x, w, h, args["sx"], args["sy"], r, tome_info,
-                                                  no_rand=not use_rand, generator=args["generator"],
+                                                  no_rand=True, generator=args["generator"],
                                                   unmerge_mode=mode, cache=cache, rand_indices=rand_indices)
 
     m_a, u_a = (m, u)
@@ -109,7 +105,7 @@ def make_tome_attention(block_class: Type[torch.nn.Module], mode: str = 'token_m
         _parent = block_class
         _mode = mode
 
-        def forward(self, x, mask=None, HW=None, block_id=None):
+        def forward_merge_both(self, x, mask=None, HW=None, block_id=None):
             B, N, C = x.shape
 
             qkv = self.qkv(x).reshape(B, N, 3, C)
@@ -138,24 +134,84 @@ def make_tome_attention(block_class: Type[torch.nn.Module], mode: str = 'token_m
             # Unmerge. Cache at index is updated
             x = u_a(x)
 
-            if self._tome_info['args']['temporal_score'] and self._mode == 'cache_merge': # Deprecated
-                if self._cache.step >= self._tome_info['args']['cache_start'] - 1:  # cache_start >= 1
-                    _, K_x, _ = self.qkv(x.clone()).reshape(B, N, 3, C).unbind(2)
+            x = self.proj(x)
+            x = self.proj_drop(x)
 
-                    cached = self._cache.feature_map.clone()
-                    _, K_cached, _ = self.qkv(cached).reshape(B, N, 3, C).unbind(2)
+            self._cache.step += 1
+            return x
 
-                    temporal_score = torch.nn.functional.cosine_similarity(K_x, K_cached, dim=-1)
+        def forward_merge_cond(self, x, mask=None, HW=None, block_id=None):
+            B, N, C = x.shape
+            assert B == 2, "Only support single image per batch in this version"
 
-                    logging.debug(f"\033[96mTemporal similarity\033[0m mean: {temporal_score.mean(dim=1)}")
-                    logging.debug(f"\033[96mTemporal similarity\033[0m max: {temporal_score.max(dim=1)[0]}")
-                    logging.debug(f"\033[96mTemporal similarity\033[0m min: {temporal_score.min(dim=1)[0]}")
+            qkv = self.qkv(x).reshape(B, N, 3, C)
+            q, k, v = qkv.unbind(2)
+            dtype = q.dtype
+            q = self.q_norm(q)
+            k = self.k_norm(k)
+
+            # Split the input metrics with conditional and unconditional
+            q_c, q_uc = torch.split(q, 1, dim=0)
+            k_c, k_uc = torch.split(k, 1, dim=0)
+            v_c, v_uc = torch.split(v, 1, dim=0)
+
+            del x, q, k, v
+
+            # == 1. Conditioned ==
+            # Compute merge configuration with metric k
+            m_a, _, u_a, _ = compute_merge(k_c, self._mode, self._tome_info, self._cache)
+            q_c, k_c, v_c = m_a(q_c), m_a(k_c), m_a(v_c)
+            new_N = q_c.shape[1]
+
+            # Reshape
+            q_c = q_c.reshape(B // 2, new_N, self.num_heads, C // self.num_heads).to(dtype)
+            k_c = k_c.reshape(B // 2, new_N, self.num_heads, C // self.num_heads).to(dtype)
+            v_c = v_c.reshape(B // 2, new_N, self.num_heads, C // self.num_heads).to(dtype)
+
+            q_uc = q_uc.reshape(B // 2, N, self.num_heads, C // self.num_heads).to(dtype)
+            k_uc = k_uc.reshape(B // 2, N, self.num_heads, C // self.num_heads).to(dtype)
+            v_uc = v_uc.reshape(B // 2, N, self.num_heads, C // self.num_heads).to(dtype)
+
+            attn_bias = None
+            if mask is not None:
+                attn_bias = torch.zeros([B * self.num_heads, q_c.shape[1], k_c.shape[1]], dtype=q_c.dtype, device=q_c.device)
+                attn_bias.masked_fill_(mask.squeeze(1).repeat(self.num_heads, 1, 1) == 0, float('-inf'))
+
+            # Attention with cond (merged)
+            x_c = xformers.ops.memory_efficient_attention(q_c, k_c, v_c, p=self.attn_drop.p, attn_bias=attn_bias)
+            x_c = x_c.view(B // 2, new_N, C)
+            # Unmerge. Cache at index is updated
+            x_c = u_a(x_c)
+
+            # == 2. Unconditioned ==
+            if self._tome_info['args']['broadcast'] and self._tome_info['args']['broadcast_start'] <= self._cache.step <= self._tome_info['args']['broadcast_end']:
+                should_save = self._cache.should_save(self._tome_info['args']['broadcast_start'])
+                if should_save:
+                    # Attention with uncond (unmerged)
+                    x_uc = xformers.ops.memory_efficient_attention(q_uc, k_uc, v_uc, p=self.attn_drop.p, attn_bias=attn_bias)
+                    x_uc = x_uc.view(B // 2, N, C)
+                    self._cache.save(x_uc)
+                else:
+                    x_uc = self._cache.broadcast()
+            else:
+                x_uc = xformers.ops.memory_efficient_attention(q_uc, k_uc, v_uc, p=self.attn_drop.p, attn_bias=attn_bias)
+                x_uc = x_uc.view(B // 2, N, C)
+
+            x = torch.stack([x_c, x_uc]).squeeze(dim=1)
 
             x = self.proj(x)
             x = self.proj_drop(x)
 
             self._cache.step += 1
             return x
+
+        def forward(self, x, mask=None, HW=None, block_id=None):
+            merge_cond = self._tome_info['args']['merge_cond']
+            if merge_cond:
+                return self.forward_merge_cond(x, mask, HW, block_id)
+            else:
+                return self.forward_merge_both(x, mask, HW, block_id)
+
 
     return PatchedAttentionKVCompress
 
@@ -363,6 +419,7 @@ def apply_patch(
         # ==== 1. Merging ==== #
         merge_metric: str,
         ratio: float,
+        merge_cond: bool = False,
         sx: int = 2, sy: int = 2,
         use_rand: bool = True,
         merge_mlp: bool = False,
@@ -385,7 +442,6 @@ def apply_patch(
         broadcast_step: tuple[int] = (2, 18),
 
         # == 3. Misc == #
-        temporal_score: bool = False,
         hybrid_unmerge: float = 0.0,
 ):
 
@@ -404,6 +460,9 @@ def apply_patch(
     assert len(start_indices) == len(num_blocks), "Invalid merging blocks"
     assert len(cache_start_indices) == len(cache_num_blocks), "Invalid merging blocks"
     assert len(broadcast_start_indices) == len(broadcast_num_blocks), "Invalid merging blocks"
+
+    if merge_metric == 'x':
+        merge_cond = False
 
     if len(start_indices) != 0:
         token_merge = True
@@ -441,6 +500,7 @@ def apply_patch(
         "\033[96mArguments:\033[0m\n"
         "\033[95m# ==== 1. Merging ==== #\033[0m\n"
         f"merge_metric: {merge_metric}\n"
+        f"merge_cond: {merge_cond}\n"
         f"ratio: {ratio}\n"
         f"sx: {sx}, sy: {sy}\n"
         f"use_rand: {use_rand}\n"
@@ -468,7 +528,6 @@ def apply_patch(
         
         "\033[95m# == 3. Misc == #\033[0m\n"
         f"hybrid_unmerge: {hybrid_unmerge}\n"
-        f"temporal_score: {temporal_score}\n"
     )
 
     # == initialization ==
@@ -481,6 +540,7 @@ def apply_patch(
         "args": {
             # ==== 1. Merging ==== #
             "merge_metric": merge_metric,
+            "merge_cond": merge_cond,
             "ratio": ratio,
             "sx": sx, "sy": sy,
             "use_rand": use_rand,
@@ -511,9 +571,6 @@ def apply_patch(
             # == Hybrid Unmerge == #
             "hybrid_unmerge": True if hybrid_unmerge > 0.0 else False,
             "hybrid_threshold": hybrid_unmerge if hybrid_unmerge > 0.0 else 0.0,
-
-            # == Temporal Score == #
-            "temporal_score": temporal_score,
         }
     }
 
@@ -533,7 +590,7 @@ def apply_patch(
             module.__class__ = make_tome_block_fn(module.__class__, mode='token_merge')
             module._tome_info = model._tome_info
 
-            module._cache = Cache(index=index, cache_bus=model._bus)
+            module._cache = Cache(index=index, cache_bus=model._bus, broadcast_range=broadcast_range)
             logging.debug(f'Applied Token Merging patch at Block {index}')
 
     # == 2. Patch Cache Merging Blocks ==
@@ -549,7 +606,7 @@ def apply_patch(
             module.__class__ = make_tome_block_fn(module.__class__, mode='cache_merge')
             module._tome_info = model._tome_info
 
-            module._cache = Cache(index=index, cache_bus=model._bus)
+            module._cache = Cache(index=index, cache_bus=model._bus, broadcast_range=broadcast_range)
             logging.debug(f'Applied Cache Merging patch at Block {index}')
 
     # == 3. Patch Broadcast Blocks ==
