@@ -32,9 +32,9 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
     if r <= 0:
         return do_nothing, do_nothing
 
-    # Force stop
-    if cache.step > tome_info['args']['cache_end']:
-        return do_nothing, do_nothing
+    # # Force stop
+    # if cache.step > tome_info['args']['cache_end']:
+    #     return do_nothing, do_nothing
 
     gather = mps_gather_workaround if metric.device.type == "mps" else torch.gather
 

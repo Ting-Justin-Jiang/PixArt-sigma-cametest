@@ -88,7 +88,7 @@ def compute_merge(x: torch.Tensor, mode: str, tome_info: Dict[str, Any], cache: 
         rand_indices = None
 
     m, u = merge.bipartite_soft_matching_random2d(x, w, h, args["sx"], args["sy"], r, tome_info,
-                                                  no_rand=True, generator=args["generator"],
+                                                  no_rand=False, generator=args["generator"],
                                                   unmerge_mode=mode, cache=cache, rand_indices=rand_indices)
 
     m_a, u_a = (m, u)

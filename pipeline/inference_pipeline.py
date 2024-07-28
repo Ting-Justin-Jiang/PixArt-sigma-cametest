@@ -45,7 +45,7 @@ def get_args():
     parser.add_argument('--sdvae', action='store_true', help='sd vae')
 
     # == Sampling configuration == #
-    parser.add_argument('--seed', default=4096, type=int, help='Seed for the random generator')
+    parser.add_argument('--seed', default=114514810, type=int, help='Seed for the random generator')
     parser.add_argument('--sampler', default='dpm-solver', type=str, choices=['iddpm', 'dpm-solver', 'sa-solver'])
     parser.add_argument('--sample_steps', default=20, type=int, help='Number of inference steps')
     parser.add_argument('--guidance_scale', default=7.0, type=float, help='Guidance scale')

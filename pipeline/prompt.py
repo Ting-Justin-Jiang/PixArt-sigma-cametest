@@ -40,9 +40,9 @@
 PROMPT = [
     "Photorealistic rendering of Hatsune Miku standing at Tokyo city. "
     "1girl, best quality, masterpiece, boots, earrings, eyes visible through hair, gloves, grey_hair, "
-    "half_gloves, jacket, off_shoulder, dynamic pose, open_jacket "
+    "half_gloves, jacket, off_shoulder, dynamic pose, open_jacket, "
     "aqua eyes, hatsune miku, cyberpunk fashion, underground, skirt, solo art, "
-    "absurdres official art, magazine cover",
+    "absurdres official art, magazine cover, safe for work",
 
     "huge ethereal winter flowers by the stairs, carved ice door at the end of ice steps, magical atmosphere. "
     "an arctic fox sit on the stair in the middle of the photo. UHD, 8K, Unreal render, cinematic blue, masterpiece",
