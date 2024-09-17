@@ -37,19 +37,31 @@
 # ]
 
 
+# PROMPT = [
+#     "Photorealistic rendering of Hatsune Miku standing in front of a graffiti wall. "
+#     "1girl, best quality, masterpiece, Nike air jordan shoes, earrings, eyes visible through hair, gloves, grey_hair, "
+#     "half_gloves, jacket, off_shoulder, skateboarding, dynamic pose, open_jacket, "
+#     "aqua eyes, hatsune miku, cyberpunk fashion, underground, skirt, solo art, "
+#     "absurdres official art, magazine cover, safe for work",
+#
+#     "huge ethereal white winter flowers by the stairs, carved ice door at the end of ice steps, magical atmosphere. "
+#     "an arctic fox sit on the stair in the middle of the photo. UHD, 8K, Unreal render, cinematic blue, masterpiece, "
+#     "ultra detailed flower, ultra high resolution flora",
+#
+#     "a cute little matte low poly isometric cherry blossom forest island, pink waterfalls, mist, lat lighting, soft shadows, "
+#     "trending on artstation, 3d render, monument valley, fez video game",
+#
+#     "Pikachu wearing a future mech standing at a old factory, flurry, pixar, natural and realistic lighting and shading, hq, ultra detail, "
+#     "3D render, C4D, octane render, ray tracing, 8k"
+# ]
+
+
 PROMPT = [
-    "Photorealistic rendering of Hatsune Miku standing at Tokyo city. "
-    "1girl, best quality, masterpiece, boots, earrings, eyes visible through hair, gloves, grey_hair, "
-    "half_gloves, jacket, off_shoulder, dynamic pose, open_jacket, "
-    "aqua eyes, hatsune miku, cyberpunk fashion, underground, skirt, solo art, "
-    "absurdres official art, magazine cover, safe for work",
-
-    "huge ethereal winter flowers by the stairs, carved ice door at the end of ice steps, magical atmosphere. "
-    "an arctic fox sit on the stair in the middle of the photo. UHD, 8K, Unreal render, cinematic blue, masterpiece",
-
-    "a cute little matte low poly isometric cherry blossom forest island, pink waterfalls, mist, lat lighting, soft shadows, "
-    "trending on artstation, 3d render, monument valley, fez video game",
-
-    "Bunny wearing a future mech standing at a old factory, pixar, natural and realistic lighting and shading, hq, ultra detail, "
-    "3D render, C4D, octane render, ray tracing, 8k"
+    "a photo of a messy and cozy bedroom",
+    #
+    # "a photo of a beautiful street in a small europe town with people walking about and riding bikes",
+    #
+    # "a photo of a beautiful and cozy cafe in a small town",
+    #
+    # "a photo of a beautiful family house in Europe in a rainy day"
 ]

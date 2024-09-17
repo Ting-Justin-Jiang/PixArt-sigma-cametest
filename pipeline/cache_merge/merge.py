@@ -26,15 +26,21 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
                                      generator: torch.Generator = None,
                                      unmerge_mode: str = 'token_merge',
                                      cache: any = None,
-                                     rand_indices: torch.Tensor = None) -> Tuple[Callable, Callable]:
+                                     rand_indices: list = None) -> Tuple[Callable, Callable]:
     B, N, _ = metric.shape
 
     if r <= 0:
         return do_nothing, do_nothing
 
-    # # Force stop
-    # if cache.step > tome_info['args']['cache_end']:
-    #     return do_nothing, do_nothing
+    # # Force stop (In most case, broadcast_start < cache_start
+    if cache.step < tome_info['args']['broadcast_start'] or cache.step > tome_info['args']['broadcast_end']:
+        if cache.step == tome_info['args']['broadcast_start'] - 1 and unmerge_mode == 'cache_merge':
+            def initial_push(x: torch.Tensor):
+                        cache.push(x)
+                        return x
+            return do_nothing, initial_push
+        else:
+            return do_nothing, do_nothing
 
     gather = mps_gather_workaround if metric.device.type == "mps" else torch.gather
 
@@ -47,7 +53,7 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
         else:
             if unmerge_mode == 'cache_merge':
                 # retrieve from a pre-defined semi-random schedule
-                rand_idx = rand_indices[cache.step].to(generator.device)
+                rand_idx = rand_indices.pop().to(generator.device)
             else:
                 rand_idx = torch.randint(sy*sx, size=(hsy, wsx, 1), device=generator.device, generator=generator).to(metric.device)
 
@@ -105,13 +111,15 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
             tome_src_idx, tome_dst_idx = (src_idx[..., :r_c, :], dst_idx[..., :r_c, :])
             came_src_idx, came_dst_idx = (src_idx[..., r_c:, :], dst_idx[..., r_c:, :])
 
-    def merge(x: torch.Tensor, mode="mean") -> torch.Tensor:
+    def merge(x: torch.Tensor, mode="mean", prune=False) -> torch.Tensor:
         src, dst = split(x)
         n, t1, c = src.shape
 
         unm = gather(src, dim=-2, index=unm_idx.expand(n, t1 - r, c))
-        src = gather(src, dim=-2, index=src_idx.expand(n, r, c))
-        dst = dst.scatter_reduce_(-2, dst_idx.expand(n, r, c), src, reduce=mode)
+
+        if not prune:
+            src = gather(src, dim=-2, index=src_idx.expand(n, r, c))
+            dst = dst.scatter_reduce_(-2, dst_idx.expand(n, r, c), src, reduce=mode)
 
         # Simply concat
         out = torch.cat([unm, dst], dim=1)
@@ -120,7 +128,7 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
         return out
 
 
-    def unmerge(x: torch.Tensor) -> torch.Tensor:
+    def unmerge(x: torch.Tensor, unmerge_mode=unmerge_mode) -> torch.Tensor:
         unm_len = unm_idx.shape[1]
         unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
         _, _, c = unm.shape

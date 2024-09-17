@@ -57,10 +57,10 @@ class Cache:
 
     def should_save(self, broadcast_start: int) -> bool:
         if (self.step - broadcast_start) % self.broadcast_range == 0:
-            logging.debug(f"\033[96mBroadcast\033[0m: Save at step: {self.step}")
+            logging.debug(f"\033[96mBroadcast\033[0m: Save at step: {self.step} cache index: \033[91m{self.index}\033[0m")
             return True  # Save at this step
         else:
-            logging.debug(f"\033[96mBroadcast\033[0m: Broadcast at step: {self.step}")
+            logging.debug(f"\033[96mBroadcast\033[0m: Broadcast at step: {self.step} cache index: \033[91m{self.index}\033[0m")
             return False # Broadcast at this step
 
 
@@ -209,8 +209,21 @@ def make_tome_attention(block_class: Type[torch.nn.Module], mode: str = 'token_m
             merge_cond = self._tome_info['args']['merge_cond']
             if merge_cond:
                 return self.forward_merge_cond(x, mask, HW, block_id)
+
             else:
-                return self.forward_merge_both(x, mask, HW, block_id)
+                if self._tome_info['args']['broadcast_start'] <= self._cache.step <= self._tome_info['args']['broadcast_end']:
+                    should_save = self._cache.should_save(self._tome_info['args']['broadcast_start'])
+                    if should_save:
+                        x = self.forward_merge_both(x, mask, HW, block_id)
+                        self._cache.save(x)
+                        return x
+                    else:
+                        x = self._cache.broadcast()
+                        self._cache.step += 1
+                        return x
+                else:
+                    x = self.forward_merge_both(x, mask, HW, block_id)
+                    return x
 
 
     return PatchedAttentionKVCompress
@@ -368,7 +381,7 @@ def patch_tome_blocks(model: torch.nn.Module, start_indices: list[int], num_bloc
                     raise ValueError
 
 
-def generate_semi_random_indices(sy: int, sx: int, h: int, w: int, steps: int) -> torch.Tensor:
+def generate_semi_random_indices(sy: int, sx: int, h: int, w: int, steps: int) -> list:
     """
     generates a semi-random merging schedule given the grid size
     """
@@ -377,6 +390,7 @@ def generate_semi_random_indices(sy: int, sx: int, h: int, w: int, steps: int) -
     num_cycles = (steps + cycle_length - 1) // cycle_length
 
     full_sequence = []
+    rand_idx = []
 
     for _ in range(hsy * wsx):
         sequence = torch.cat([
@@ -385,8 +399,10 @@ def generate_semi_random_indices(sy: int, sx: int, h: int, w: int, steps: int) -
         ])
         full_sequence.append(sequence[:steps])
 
-    full_sequence = torch.stack(full_sequence).to(torch.int64)
-    rand_idx = full_sequence.reshape(hsy, wsx, steps).permute(2, 0, 1).unsqueeze(-1)
+    for step in range(steps):
+        step_tensor = torch.stack([seq[step] for seq in full_sequence]).reshape(hsy, wsx)
+        rand_idx.append(step_tensor.unsqueeze(-1))
+
     return rand_idx
 
 

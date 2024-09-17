@@ -1,10 +1,6 @@
-"""
-Something is still off. 8Bit T5 trades performance for memory cost.
-"""
-
 import argparse
 import sys
-import time
+import json
 from pathlib import Path
 current_file_path = Path(__file__).resolve()
 sys.path.insert(0, str(current_file_path.parent.parent))
@@ -12,7 +8,7 @@ import os
 import random
 import torch
 from torchvision.utils import save_image
-from diffusion import IDDPM, DPMS, SASolverSampler
+from diffusion import DPMS
 from diffusers.models import AutoencoderKL
 from tools.download import find_model
 from datetime import datetime
@@ -20,6 +16,8 @@ from typing import List, Union
 import numpy as np
 from transformers import T5EncoderModel, T5Tokenizer
 import gc
+from tqdm import tqdm
+from PIL import Image
 
 from diffusion.model.t5 import T5Embedder
 from diffusion.model.utils import prepare_prompt_ar, resize_and_crop_tensor
@@ -45,14 +43,16 @@ def get_args():
     parser.add_argument('--sdvae', action='store_true', help='sd vae')
 
     # == Sampling configuration == #
-    parser.add_argument('--seed', default=44103688372, type=int, help='Seed for the random generator')
-    parser.add_argument('--sampler', default='dpm-solver', type=str, choices=['iddpm', 'dpm-solver', 'sa-solver'])
+    parser.add_argument('--seed', default=0, type=int, help='Seed for the random generator')
     parser.add_argument('--sample_steps', default=20, type=int, help='Number of inference steps')
     parser.add_argument('--guidance_scale', default=7.5, type=float, help='Guidance scale')
 
+    # == Evaluation configuration == #
+    parser.add_argument("--num-fid-samples", type=int, default=20)
+
     # ==== ==== ==== ==== ==== ==== ==== ==== ==== #
     # ==== Acceleration Patch ==== #
-    parser.add_argument('--experiment-folder', type=str, default='samples/inference/cfg=7.5')
+    parser.add_argument('--experiment-folder', type=str, default='samples/experiment/[YOUR-EXP-NAME]')
 
     # ==== 1. Merging ==== #
     parser.add_argument("--merge-ratio", type=float, default=0.4, help="Ratio of tokens to merge")
@@ -69,17 +69,11 @@ def get_args():
     parser.add_argument("--cache-step", type=lambda s: (int(item) for item in s.split(',')), default=(7, 18))
     parser.add_argument("--push-unmerged", action=argparse.BooleanOptionalAction, type=bool, default=True)
 
-    # == 1.2.1 Hybrid Unmerge (Deprecated) == #
-    parser.add_argument("--hybrid-unmerge", type=float, default=0.0, help="cosine similarity threshold, set 0.0 to bypass")
-
     # == 2. Broadcast (Temporal) == #
     parser.add_argument("--broadcast-range", type=int, default=2, help="broadcast range, set 0 to bypass")
     parser.add_argument("--broadcast-step", type=lambda s: (int(item) for item in s.split(',')), default=(7, 18))
     parser.add_argument("--broadcast-start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[1, 16])
     parser.add_argument("--broadcast-num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[7, 5])
-
-    # == Misc == #
-    parser.add_argument("--temporal-score", action=argparse.BooleanOptionalAction, type=bool, default=False)
 
     return parser.parse_args()
 
@@ -97,6 +91,23 @@ def randomize_seed_fn(seed: int, randomize_seed: bool) -> int:
     return seed
 
 
+def create_npz_from_sample_folder(sample_dir, num=50_000):
+    """
+    Builds a single .npz file from a folder of .png samples.
+    """
+    samples = []
+    for i in tqdm(range(num), desc="Building .npz file from samples"):
+        sample_pil = Image.open(f"{sample_dir}/{i:06d}.png")
+        sample_np = np.asarray(sample_pil).astype(np.uint8)
+        samples.append(sample_np)
+    samples = np.stack(samples)
+    assert samples.shape == (num, samples.shape[1], samples.shape[2], 3)
+    npz_path = f"{sample_dir}.npz"
+    np.savez(npz_path, arr_0=samples)
+    print(f"Saved .npz file to {npz_path} [shape={samples.shape}].")
+    return npz_path
+
+
 @torch.inference_mode()
 def generate_img(prompt, sampler, sample_steps, scale, seed=0, randomize_seed=False):
     flush()
@@ -108,11 +119,12 @@ def generate_img(prompt, sampler, sample_steps, scale, seed=0, randomize_seed=Fa
 
     os.makedirs(f'output/demo/online_demo_prompts/', exist_ok=True)
     save_promt_path = f'output/demo/online_demo_prompts/tested_prompts{datetime.now().date()}.txt'
+
     with open(save_promt_path, 'a') as f:
         f.write(prompt + '\n')
-    print(prompt)
     prompt_clean, prompt_show, hw, ar, custom_hw = prepare_prompt_ar(prompt, base_ratios, device=device)      # ar for aspect ratio
     prompt_clean = prompt_clean.strip()
+
     if isinstance(prompt_clean, str):
         prompts = [prompt_clean]
 
@@ -126,20 +138,7 @@ def generate_img(prompt, sampler, sample_steps, scale, seed=0, randomize_seed=Fa
     latent_size_h, latent_size_w = int(hw[0, 0]//8), int(hw[0, 1]//8)
 
     # Sample images:
-    if sampler == 'iddpm':
-        # Create sampling noise:
-        n = len(prompts)
-        z = torch.randn(n, 4, latent_size_h, latent_size_w, device=device).repeat(2, 1, 1, 1)
-        model_kwargs = dict(y=torch.cat([caption_embs, null_y]),
-                            cfg_scale=scale, data_info={'img_hw': hw, 'aspect_ratio': ar}, mask=emb_masks)
-        diffusion = IDDPM(str(sample_steps))
-        start = time.perf_counter()
-        samples = diffusion.p_sample_loop(
-            model.forward_with_cfg, z.shape, z, clip_denoised=False, model_kwargs=model_kwargs, progress=True,
-            device=device
-        )
-        samples, _ = samples.chunk(2, dim=0)  # Remove null class samples
-    elif sampler == 'dpm-solver':
+    if sampler == 'dpm-solver':
         # Create sampling noise:
         n = len(prompts)
         z = torch.randn(n, 4, latent_size_h, latent_size_w, device=device)
@@ -149,7 +148,6 @@ def generate_img(prompt, sampler, sample_steps, scale, seed=0, randomize_seed=Fa
                           uncondition=null_y,
                           cfg_scale=scale,
                           model_kwargs=model_kwargs)
-        start = time.perf_counter()
         samples = dpm_solver.sample(
             z,
             steps=sample_steps,
@@ -157,36 +155,22 @@ def generate_img(prompt, sampler, sample_steps, scale, seed=0, randomize_seed=Fa
             skip_type="time_uniform",
             method="multistep",
         )
-    elif sampler == 'sa-solver':
-        # Create sampling noise:
-        n = len(prompts)
-        model_kwargs = dict(data_info={'img_hw': hw, 'aspect_ratio': ar}, mask=emb_masks)
-        sa_solver = SASolverSampler(model.forward_with_dpmsolver, device=device)
-        start = time.perf_counter()
-        samples = sa_solver.sample(
-            S=sample_steps,
-            batch_size=n,
-            shape=(4, latent_size_h, latent_size_w),
-            eta=1,
-            conditioning=caption_embs,
-            unconditional_conditioning=null_y,
-            unconditional_guidance_scale=scale,
-            model_kwargs=model_kwargs,
-        )[0]
-
-    runtime = (time.perf_counter() - start)
+    else:
+        raise RuntimeError("Use only DPM-Solver for FID Eval")
 
     samples = samples.to(weight_dtype)
     samples = vae.decode(samples / vae.config.scaling_factor).sample
 
     samples = resize_and_crop_tensor(samples, custom_hw[0,1], custom_hw[0,0])
-    return samples.squeeze(0), runtime
+    return samples.squeeze(0)
 
 
 if __name__ == '__main__':
     from diffusion.utils.logger import get_root_logger
+    assert torch.cuda.is_available()
+
     args = get_args()
-    device = "cuda" if torch.cuda.is_available() else "cpu"
+    device = 'cuda'
     logger = get_root_logger()
 
     assert args.image_size in [256, 512, 1024, 2048], \
@@ -235,9 +219,7 @@ if __name__ == '__main__':
                                   broadcast_range=args.broadcast_range,
                                   broadcast_step=args.broadcast_step,
                                   broadcast_start_indices=args.broadcast_start_indices,
-                                  broadcast_num_blocks=args.broadcast_num_blocks,
-
-                                  hybrid_unmerge=args.hybrid_unmerge)
+                                  broadcast_num_blocks=args.broadcast_num_blocks)
 
     model.eval()
     base_ratios = eval(f'ASPECT_RATIO_{args.image_size}_TEST')
@@ -252,26 +234,26 @@ if __name__ == '__main__':
     null_caption_token = tokenizer("", max_length=max_sequence_length, padding="max_length", truncation=True, return_tensors="pt").to(device)
     null_caption_embs = text_encoder(null_caption_token.input_ids, attention_mask=null_caption_token.attention_mask)[0]
 
-    prompts = PROMPT
-    outputs = []
-    total_runtime = 0.
+    # Prepare Prompts
+    with open('pipeline/data/annotations/captions_val2014.json', 'r') as f:
+        coco_data = json.load(f)
+
+    annotations = coco_data['annotations']
+    prompts = [ann['caption'] for ann in annotations]
+
+    if len(prompts) > args.num_fid_samples:
+        prompts = random.sample(prompts, args.num_fid_samples)
+
+    # Sampling
+    index = 0
     os.makedirs(args.experiment_folder, exist_ok=True)
 
-    # multi-sampling
     for prompt in prompts:
-        output, runtime = generate_img(prompt, args.sampler, args.sample_steps, args.guidance_scale, seed=args.seed, randomize_seed=False)
-        outputs.append(output)
-        total_runtime += runtime
+        output = generate_img(prompt, 'dpm-solver', args.sample_steps, args.guidance_scale, seed=args.seed, randomize_seed=False)
+        save_path = f"{args.experiment_folder}/{index:06d}.png"
+        save_image(output, save_path, nrow=4, normalize=True, value_range=(-1, 1))
         patch.reset_cache(model)
+        index += 1
 
-    outputs = torch.stack(outputs, dim=0)
-
-    # Save and display images:
-    if args.merge_ratio > 0.0:
-        save_path = f"{args.experiment_folder}/{args.merge_metric}_merge-{args.merge_ratio}-token_{args.start_indices}-cache_{args.cache_start_indices}-broadcast_{args.broadcast_range}_{args.broadcast_start_indices}.png"
-    else:
-        save_path = f"{args.experiment_folder}/no-merge.png"
-
-    save_image(outputs, save_path, nrow=4, normalize=True, value_range=(-1, 1))
-
-    print(f"Finish sampling {len(prompts)} images in {total_runtime} seconds.")
+    create_npz_from_sample_folder(args.experiment_folder, args.num_fid_samples)
+    print("Done.")
