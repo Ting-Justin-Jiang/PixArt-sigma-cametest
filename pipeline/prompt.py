@@ -37,31 +37,28 @@
 # ]
 
 
-# PROMPT = [
-#     "Photorealistic rendering of Hatsune Miku standing in front of a graffiti wall. "
-#     "1girl, best quality, masterpiece, Nike air jordan shoes, earrings, eyes visible through hair, gloves, grey_hair, "
-#     "half_gloves, jacket, off_shoulder, skateboarding, dynamic pose, open_jacket, "
-#     "aqua eyes, hatsune miku, cyberpunk fashion, underground, skirt, solo art, "
-#     "absurdres official art, magazine cover, safe for work",
-#
-#     "huge ethereal white winter flowers by the stairs, carved ice door at the end of ice steps, magical atmosphere. "
-#     "an arctic fox sit on the stair in the middle of the photo. UHD, 8K, Unreal render, cinematic blue, masterpiece, "
-#     "ultra detailed flower, ultra high resolution flora",
-#
-#     "a cute little matte low poly isometric cherry blossom forest island, pink waterfalls, mist, lat lighting, soft shadows, "
-#     "trending on artstation, 3d render, monument valley, fez video game",
-#
-#     "Pikachu wearing a future mech standing at a old factory, flurry, pixar, natural and realistic lighting and shading, hq, ultra detail, "
-#     "3D render, C4D, octane render, ray tracing, 8k"
-# ]
-
-
 PROMPT = [
-    "a photo of a messy and cozy bedroom",
+    "A portal to a fairy town market under blooming Sakura tree on the wall of my messy bedroom",
+    # "A portal to a mystical town market under autumn fallen leave tree on the wall of my messy bedroom",
     #
-    # "a photo of a beautiful street in a small europe town with people walking about and riding bikes",
+    # "in the style of CNSTLL, A highly detailed, photorealistic 3D rendering of Princess Peach standing confidently in front of a colorful "
+    # "graffiti-covered wall. She is wearing Nike Air Jordan shoes and stylish earrings, with her white hair partially "
+    # "covering her eyes but still visible. Her outfit includes half-finger gloves, a trendy open jacket draped off "
+    # "one shoulder, and she's posed dynamically as if skateboarding, exuding energy and motion. The scene has vibrant,"
+    # " urban lighting that reflects off the graffiti, creating a vivid street art atmosphere.",
     #
-    # "a photo of a beautiful and cozy cafe in a small town",
+    # "in the style of CNSTLL, A highly detailed, photorealistic 3D rendering of Hatsune Miku standing confidently in a street "
+    # "style bar. She is wearing Nike Air Jordan shoes, with her white hair partially "
+    # "covering her eyes but still visible. Her outfit includes half-finger gloves, a trendy open jacket draped off "
+    # "one shoulder, and she's posed dynamically as if skateboarding, exuding energy and motion.",
+
+    # "huge ethereal white winter flowers by the stairs, carved ice door at the end of ice steps, magical atmosphere. "
+    # "an arctic fox sit on the stair in the middle of the photo. UHD, 8K, Unreal render, cinematic blue, masterpiece, "
+    # "ultra detailed flower, ultra high resolution flora",
     #
-    # "a photo of a beautiful family house in Europe in a rainy day"
+    # "a cute little matte low poly isometric cherry blossom forest island, pink waterfalls, mist, lat lighting, soft shadows, "
+    # "trending on artstation, 3d render, monument valley, fez video game",
+    #
+    # "Pikachu wearing a future mech standing at a old factory, flurry, pixar, natural and realistic lighting and shading, hq, ultra detail, "
+    # "3D render, C4D, octane render, ray tracing, 8k"
 ]

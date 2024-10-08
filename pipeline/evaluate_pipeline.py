@@ -1,3 +1,8 @@
+"""
+Degraded! Fix later
+"""
+
+
 import argparse
 import sys
 import json
@@ -64,16 +69,16 @@ def get_args():
     parser.add_argument("--num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[])
 
     # == 1.2 Cache Merging (Spatial-Temporal) == #
-    parser.add_argument("--cache-start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[8, 21])
-    parser.add_argument("--cache-num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[8, 2])
+    parser.add_argument("--cache-start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[])
+    parser.add_argument("--cache-num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[])
     parser.add_argument("--cache-step", type=lambda s: (int(item) for item in s.split(',')), default=(7, 18))
     parser.add_argument("--push-unmerged", action=argparse.BooleanOptionalAction, type=bool, default=True)
 
     # == 2. Broadcast (Temporal) == #
     parser.add_argument("--broadcast-range", type=int, default=2, help="broadcast range, set 0 to bypass")
     parser.add_argument("--broadcast-step", type=lambda s: (int(item) for item in s.split(',')), default=(7, 18))
-    parser.add_argument("--broadcast-start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[1, 16])
-    parser.add_argument("--broadcast-num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[7, 5])
+    parser.add_argument("--broadcast-start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[])
+    parser.add_argument("--broadcast-num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[])
 
     return parser.parse_args()
 
@@ -230,7 +235,7 @@ if __name__ == '__main__':
         vae = AutoencoderKL.from_pretrained(f"PixArt-alpha/pixart_sigma_sdxlvae_T5_diffusers", subfolder="vae").to(device).to(weight_dtype)
 
     tokenizer = T5Tokenizer.from_pretrained("PixArt-alpha/pixart_sigma_sdxlvae_T5_diffusers", subfolder="tokenizer")
-    text_encoder = T5EncoderModel.from_pretrained("PixArt-alpha/pixart_sigma_sdxlvae_T5_diffusers", load_in_8bit=True, subfolder="text_encoder")
+    text_encoder = T5EncoderModel.from_pretrained("PixArt-alpha/pixart_sigma_sdxlvae_T5_diffusers", subfolder="text_encoder").to(device)
     null_caption_token = tokenizer("", max_length=max_sequence_length, padding="max_length", truncation=True, return_tensors="pt").to(device)
     null_caption_embs = text_encoder(null_caption_token.input_ids, attention_mask=null_caption_token.attention_mask)[0]
 
@@ -241,6 +246,7 @@ if __name__ == '__main__':
     annotations = coco_data['annotations']
     prompts = [ann['caption'] for ann in annotations]
 
+    random.seed(args.seed)
     if len(prompts) > args.num_fid_samples:
         prompts = random.sample(prompts, args.num_fid_samples)
 

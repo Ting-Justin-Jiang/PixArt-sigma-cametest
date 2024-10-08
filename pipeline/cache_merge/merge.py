@@ -4,7 +4,7 @@ from typing import Tuple, Callable
 import logging
 
 
-def do_nothing(x: torch.Tensor, mode: str = None):
+def do_nothing(x: torch.Tensor, mode: str = None, prune: bool = None):
     return x
 
 
@@ -32,10 +32,10 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
     if r <= 0:
         return do_nothing, do_nothing
 
-    # # Force stop (In most case, broadcast_start < cache_start
-    if cache.step < tome_info['args']['broadcast_start'] or cache.step > tome_info['args']['broadcast_end']:
-        if cache.step == tome_info['args']['broadcast_start'] - 1 and unmerge_mode == 'cache_merge':
-            def initial_push(x: torch.Tensor):
+    # Force deactivate
+    if cache.step < tome_info['args']['merge_start'] or cache.step > tome_info['args']['merge_end']:
+        if cache.step == tome_info['args']['merge_start'] - 1 and unmerge_mode == 'cache_merge':
+            def initial_push(x: torch.Tensor, mode: str = None):
                         cache.push(x)
                         return x
             return do_nothing, initial_push
@@ -102,15 +102,6 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
         src_idx = edge_idx[..., :r, :]  # Merged Tokens
         dst_idx = gather(node_idx[..., None], dim=-2, index=src_idx)  # dst indices src tokens should merge to
 
-        if tome_info['args']['hybrid_unmerge']:
-            threshold = tome_info['args']['hybrid_threshold']
-            mask = node_max.gather(dim=-1, index=src_idx.squeeze(-1)) >= threshold
-            r_c = math.floor(mask.sum(dim=-1).float().mean().item()) # this looks so bad ...
-
-            # further partition of src_idx, dst_idx
-            tome_src_idx, tome_dst_idx = (src_idx[..., :r_c, :], dst_idx[..., :r_c, :])
-            came_src_idx, came_dst_idx = (src_idx[..., r_c:, :], dst_idx[..., r_c:, :])
-
     def merge(x: torch.Tensor, mode="mean", prune=False) -> torch.Tensor:
         src, dst = split(x)
         n, t1, c = src.shape
@@ -127,7 +118,6 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
                       f"at block index: \033[91m{cache.index}\033[0m")
         return out
 
-
     def unmerge(x: torch.Tensor, unmerge_mode=unmerge_mode) -> torch.Tensor:
         unm_len = unm_idx.shape[1]
         unm, dst = x[..., :unm_len, :], x[..., unm_len:, :]
@@ -135,38 +125,10 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
 
         if unmerge_mode == 'cache_merge' and tome_info['args']['cache_start'] <= cache.step <= tome_info['args']['cache_end']:
             # == Branch 1: Improved Merging middle steps
-            # Only proceed improved unmerging mechanism during middle steps
-
-            if tome_info['args']['hybrid_unmerge']:
-                # == SubBranch 1: Hybrid Unmerge
-                # use hybrid unmerging: both cache and dup computation
-                cache.push(dst, index=b_idx.expand(B, num_dst, c))
-                if tome_info['args']['push_unmerged']:
-                    cache.push(unm, index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=unm_idx).expand(B, unm_len, c))
-
-                # Partition src_idx and dst_idx
-                came_src_idx_expanded = gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=came_src_idx).expand(B, r - r_c, c)
-                came_src = cache.pop(index=came_src_idx_expanded)
-
-                tome_dst_idx_expanded = tome_dst_idx.expand(B, r_c, c)
-                tome_src = gather(dst, dim=-2, index=tome_dst_idx_expanded)
-
-                logging.debug(f"\033[92mHybrid Unmerging: duplicate approximate (tome) src token {tome_src.shape}, cached approximate (came) src token {came_src.shape}\033[0m")
-
-                # == Combine back to the original shape (Branch 1 SubBranch 1)
-                out = torch.zeros(B, N, c, device=x.device, dtype=x.dtype)
-                out.scatter_(dim=-2, index=b_idx.expand(B, num_dst, c), src=dst)
-                out.scatter_(dim=-2, index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=unm_idx).expand(B, unm_len, c), src=unm)
-                out.scatter_(dim=-2, index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=tome_src_idx).expand(B, r_c, c), src=tome_src)
-                out.scatter_(dim=-2, index=came_src_idx_expanded, src=came_src)
-                return out
-
-            else:
-                # == SubBranch 2: Cache Unmerge
-                cache.push(dst, index=b_idx.expand(B, num_dst, c))
-                if tome_info['args']['push_unmerged']:
-                    cache.push(unm, index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=unm_idx).expand(B, unm_len, c))
-                src = cache.pop(index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=src_idx).expand(B, r, c))
+            cache.push(dst, index=b_idx.expand(B, num_dst, c))
+            if tome_info['args']['push_unmerged']:
+                cache.push(unm, index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=unm_idx).expand(B, unm_len, c))
+            src = cache.pop(index=gather(a_idx.expand(B, a_idx.shape[1], 1), dim=1, index=src_idx).expand(B, r, c))
 
         else:
             # == Branch 2: Token Merging & Improved Merging first/last steps

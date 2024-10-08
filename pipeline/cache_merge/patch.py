@@ -25,6 +25,7 @@ class Cache:
         self.feature_map = None
         self.feature_map_broadcast = None
         self.index = index
+        self.rand_indices = None
         self.broadcast_range = broadcast_range
         self.step = 0
 
@@ -75,15 +76,11 @@ def compute_merge(x: torch.Tensor, mode: str, tome_info: Dict[str, Any], cache: 
     elif args["generator"].device != x.device:
         args["generator"] = init_generator(x.device, fallback=args["generator"])
 
-    # retrieve (or create) semi-random merging schedule
+    # retrieve semi-random merging schedule
     if mode == 'cache_merge':
-        if cache.index not in cache.cache_bus.rand_indices:
-            rand_indices = generate_semi_random_indices(tome_info["args"]['sy'], tome_info["args"]['sx'], h, w, steps=20)
-            cache.cache_bus.rand_indices[cache.index] = rand_indices
-            logging.debug(
-                f"\033[96mSemi Random Schedule\033[0m: Initial push to cache index: \033[91m{cache.index}\033[0m")
-        else:
-            rand_indices = cache.cache_bus.rand_indices[cache.index]
+        if cache.rand_indices is None:
+            cache.rand_indices = cache.cache_bus.rand_indices[cache.index][:]
+        rand_indices = cache.rand_indices
     else:
         rand_indices = None
 
@@ -92,14 +89,11 @@ def compute_merge(x: torch.Tensor, mode: str, tome_info: Dict[str, Any], cache: 
                                                   unmerge_mode=mode, cache=cache, rand_indices=rand_indices)
 
     m_a, u_a = (m, u)
-    m_m, u_m = (m, u) if args["merge_mlp"] else (merge.do_nothing, merge.do_nothing)
-
+    m_m, u_m = (m, u)
     return m_a, m_m, u_a, u_m
 
 
-########################################################################################################################
 # = k based = #
-########################################################################################################################
 def make_tome_attention(block_class: Type[torch.nn.Module], mode: str = 'token_merge') -> Type[torch.nn.Module]:
     class PatchedAttentionKVCompress(block_class):
         _parent = block_class
@@ -116,7 +110,9 @@ def make_tome_attention(block_class: Type[torch.nn.Module], mode: str = 'token_m
 
             # Compute merge
             m_a, _, u_a, _ = compute_merge(k, self._mode, self._tome_info, self._cache)
-            q, k, v = m_a(q), m_a(k), m_a(v)
+
+            prune = self._tome_info['args']['prune']
+            q, k, v = m_a(q, prune=prune), m_a(k, prune=prune), m_a(v, prune=prune)
             new_N = q.shape[1]
 
             q = q.reshape(B, new_N, self.num_heads, C // self.num_heads).to(dtype)
@@ -206,32 +202,26 @@ def make_tome_attention(block_class: Type[torch.nn.Module], mode: str = 'token_m
             return x
 
         def forward(self, x, mask=None, HW=None, block_id=None):
-            merge_cond = self._tome_info['args']['merge_cond']
-            if merge_cond:
+            if self._tome_info['args']['merge_cond']:
                 return self.forward_merge_cond(x, mask, HW, block_id)
 
-            else:
-                if self._tome_info['args']['broadcast_start'] <= self._cache.step <= self._tome_info['args']['broadcast_end']:
-                    should_save = self._cache.should_save(self._tome_info['args']['broadcast_start'])
-                    if should_save:
-                        x = self.forward_merge_both(x, mask, HW, block_id)
-                        self._cache.save(x)
-                        return x
-                    else:
-                        x = self._cache.broadcast()
-                        self._cache.step += 1
-                        return x
-                else:
+            if (self._tome_info['args']['broadcast'] and
+                self._tome_info['args']['broadcast_start'] <= self._cache.step <= self._tome_info['args']['broadcast_end']
+            ):
+                if self._cache.should_save(self._tome_info['args']['broadcast_start']):
                     x = self.forward_merge_both(x, mask, HW, block_id)
-                    return x
+                    self._cache.save(x)
+                else:
+                    x = self._cache.broadcast()
+                    self._cache.step += 1
+                return x
 
+            return self.forward_merge_both(x, mask, HW, block_id)
 
     return PatchedAttentionKVCompress
 
 
-########################################################################################################################
 # = x based = #
-########################################################################################################################
 def make_tome_block(block_class: Type[torch.nn.Module], mode: str = 'token_merge') -> Type[torch.nn.Module]:
     class PatchedPixArtMSBlock(block_class):
         _parent = block_class
@@ -297,7 +287,6 @@ def make_diffusers_tome_block(block_class: Type[torch.nn.Module], mode: str = 't
             """
             Adapted from Huggingface Diffuser
             """
-
             # 0. Self-Attention
             batch_size = hidden_states.shape[0]
 
@@ -360,54 +349,63 @@ def make_diffusers_tome_block(block_class: Type[torch.nn.Module], mode: str = 't
     return PatchedBasicTransformerBlock
 
 
-def patch_tome_blocks(model: torch.nn.Module, start_indices: list[int], num_blocks: list[int], merge_metric: str):
-    index = 0
-    block_ranges = []
+def yield_blocks(
+    model: torch.nn.Module,
+    start_indices: list[int],
+    num_blocks: list[int],
+    merge_metric: str
+):
+    def is_target_block(module):
+        """Check if the module is a target block type."""
+        return isinstance_str(module, "PixArtMSBlock") or isinstance_str(module, "BasicTransformerBlock")
 
-    # Create ranges for each start_block and num_block
+    current_block_index = 0
+    target_indices = set()
+
+    # Generate a set of all target block indices based on start_indices and num_blocks
     for start, num in zip(start_indices, num_blocks):
-        block_ranges.extend(range(start, start + num))
+        block_indices = range(start, start + num)
+        target_indices.update(block_indices)
 
+    # Iterate over all modules in the model
     for name, module in model.named_modules():
-        if isinstance_str(module, "PixArtMSBlock") or isinstance_str(module, "BasicTransformerBlock"):
-            index += 1
-            if index in block_ranges:
+        if is_target_block(module):
+            current_block_index += 1
+            if current_block_index in target_indices:
                 if merge_metric == 'x':
-                    yield module, index
+                    # Yield the module itself
+                    yield module, current_block_index
                 elif merge_metric == 'k':
+                    # Yield the attention sub-module ('attn' or 'attn1')
                     attn_module = getattr(module, 'attn', None) or getattr(module, 'attn1', None)
-                    yield attn_module, index
+                    yield attn_module, current_block_index
                 else:
-                    raise ValueError
+                    raise ValueError(f"Invalid merge_metric: {merge_metric}")
 
 
 def generate_semi_random_indices(sy: int, sx: int, h: int, w: int, steps: int) -> list:
     """
-    generates a semi-random merging schedule given the grid size
+    Generates a semi-random merging schedule given the grid size.
     """
     hsy, wsx = h // sy, w // sx
     cycle_length = sy * sx
-    num_cycles = (steps + cycle_length - 1) // cycle_length
+    num_cycles = -(-steps // cycle_length)
 
-    full_sequence = []
-    rand_idx = []
+    num_positions = hsy * wsx
 
-    for _ in range(hsy * wsx):
-        sequence = torch.cat([
-            torch.randperm(cycle_length)
-            for _ in range(num_cycles)
-        ])
-        full_sequence.append(sequence[:steps])
+    # Generate random permutations for all positions
+    random_numbers = torch.rand(num_positions, num_cycles * cycle_length)
+    indices = random_numbers.argsort(dim=1)
+    indices = indices[:, :steps] % cycle_length  # Map indices to [0, cycle_length - 1]
 
-    for step in range(steps):
-        step_tensor = torch.stack([seq[step] for seq in full_sequence]).reshape(hsy, wsx)
-        rand_idx.append(step_tensor.unsqueeze(-1))
+    # Reshape to (hsy, wsx, steps)
+    indices = indices.view(hsy, wsx, steps)
+    rand_idx = [indices[:, :, step].unsqueeze(-1) for step in range(steps)]
 
     return rand_idx
 
 
 def reset_cache(pipeline: torch.nn.Module):
-
     is_diffusers = isinstance_str(pipeline, "PixArtSigmaPipeline")
     if is_diffusers:
         logging.info("Resetting model: Huggingface Diffuser")
@@ -416,7 +414,6 @@ def reset_cache(pipeline: torch.nn.Module):
         logging.info("Resetting model: source code")
         model = pipeline
 
-    model._bus = CacheBus()
     for _, module in model.named_modules():
         if (isinstance_str(module, "PatchedPixArtMSBlock")
             or isinstance_str(module, "PatchedBasicTransformerBlock")
@@ -433,32 +430,24 @@ def reset_cache(pipeline: torch.nn.Module):
 def apply_patch(
         model: torch.nn.Module,
         # ==== 1. Merging ==== #
-        merge_metric: str,
-        ratio: float,
-        merge_cond: bool = False,
+        metric: str, ratio: float,
+        mode: str, prune: bool,
         sx: int = 2, sy: int = 2,
         use_rand: bool = True,
-        merge_mlp: bool = False,
         latent_size: int = 32,
+        merge_cond: bool = False, # untested feature
 
-        # == 1.1 Token Merging (Spatial) == #
-        start_indices: list[int] = list[int],
+        merge_step: Tuple[int, int] = (1, 19),
+        cache_step: Tuple[int, int] = (1, 19),
+        start_blocks: list[int] = list[int],
         num_blocks: list[int] = list[int],
+        push_unmerged: bool = True,
 
-        # == 1.2 Cache Merging (Spatial-Temporal) == #
-        cache_start_indices: list[int] = list[int],
-        cache_num_blocks: list[int] = list[int],
-        cache_step: tuple[int] = (4, 15),
-        push_unmerged: bool = False,
-
-        # ==== 2. Broadcast (Temporal) ==== #
-        broadcast_start_indices: list[int] = list[int],
+        # ==== 2. Broadcast ==== #
+        broadcast_start_blocks: list[int] = list[int],
         broadcast_num_blocks: list[int] = list[int],
-        broadcast_range: int = 0,
-        broadcast_step: tuple[int] = (2, 18),
-
-        # == 3. Misc == #
-        hybrid_unmerge: float = 0.0,
+        broadcast_range: int = 1,
+        broadcast_step: tuple[int, int] = (2, 18),
 ):
 
     # == merging preparation ==
@@ -473,167 +462,117 @@ def apply_patch(
     logging.info('\033[94mApplying Token Merging\033[0m')
 
     # == assertions == #
-    assert len(start_indices) == len(num_blocks), "Invalid merging blocks"
-    assert len(cache_start_indices) == len(cache_num_blocks), "Invalid merging blocks"
-    assert len(broadcast_start_indices) == len(broadcast_num_blocks), "Invalid merging blocks"
+    assert len(start_blocks) == len(num_blocks), "Invalid merging blocks"
+    assert len(broadcast_start_blocks) == len(broadcast_num_blocks), "Invalid broadcasting blocks"
+    cache_start = max(cache_step[0], 1)  # Make sure the first step is token merging to avoid cache access
 
-    if merge_metric == 'x':
+    if metric == 'x':
         merge_cond = False
 
-    if len(start_indices) != 0:
-        token_merge = True
-    else:
-        token_merge = False
-
-    if len(cache_start_indices) != 0:
-        cache_merge = True
-        cache_start = max(cache_step[0], 1) # Make sure the first step is token merging to avoid cache access
-    else:
-        cache_merge = False
-        cache_start = max(cache_step[0], 1)
-        # cache_start = None
-        # cache_step = (None, None)
-        # hybrid_unmerge = 0.0
-
-    if broadcast_range < 1:
+    if broadcast_range <= 1:
         broadcast = False
-        broadcast_num_blocks = None
-        broadcast_start_indices = None
-        broadcast_step = (None, None)
-    else:
-        broadcast = True
+    else: broadcast = True
 
-    # Ensure provided model is PixArtMS
-    is_diffusers = isinstance_str(model, "PixArtTransformer2DModel")
+    is_diffusers = isinstance_str(model, "PixArtTransformer2DModel") # diffuser pipeline is somewhat broken right now
     if is_diffusers:
-        logging.info("Patching model from Huggingface Diffuser")
+        logging.info("Patching PixArtMS from Huggingface Diffuser")
     elif isinstance_str(model, "PixArtMS"):
-        logging.info("Patching model from source code")
+        logging.info("Patching PixArtMS from source code")
     else:
-        raise RuntimeError("Provided model was not a PixArtMS model, as expected.")
+        raise RuntimeError("Provided model was not a PixArtMS model")
 
     logging.info(
         "\033[96mArguments:\033[0m\n"
         "\033[95m# ==== 1. Merging ==== #\033[0m\n"
-        f"merge_metric: {merge_metric}\n"
-        f"merge_cond: {merge_cond}\n"
+        f"metric: {metric}\n"
+        f"mode: {mode}\n"
         f"ratio: {ratio}\n"
+        f"prune: {prune}\n"
         f"sx: {sx}, sy: {sy}\n"
         f"use_rand: {use_rand}\n"
-        f"merge_mlp: {merge_mlp}\n"
         f"latent_size: {latent_size}\n"
+        f"merge_cond: {merge_cond}\n"  # untested feature
         
-        "\033[95m# == 1.1 Token Merging (Spatial) == #\033[0m\n"
-        f"token_merge:{token_merge}\n"
-        f"start_indices: {start_indices}\n"
+        f"start_blocks: {start_blocks}\n"
         f"num_blocks: {num_blocks}\n"
-        
-        "\033[95m# == 1.2 Cache Merging (Spatial-Temporal) == #\033[0m\n"
-        f"cache_merge: {cache_merge}\n"
-        f"cache_start_indices: {cache_start_indices}\n"
-        f"cache_num_blocks: {cache_num_blocks}\n"
-        f"push_unmerged: {push_unmerged}\n"
+        f"merge_step: {merge_step}\n"
         f"cache_step: {cache_start, cache_step[-1]}\n"
+        f"push_unmerged: {push_unmerged}\n"
         
-        "\033[95m# ==== 2. Broadcast (Temporal) ==== #\033[0m\n"
+        "\033[95m# ==== 2. Broadcast ==== #\033[0m\n"
         f"broadcast: {broadcast}\n"
-        f"broadcast_start_indices: {broadcast_start_indices}\n"
+        f"broadcast_start_blocks: {broadcast_start_blocks}\n"
         f"broadcast_num_blocks: {broadcast_num_blocks}\n"
         f"broadcast_range: {broadcast_range}\n"
         f"broadcast_step: {broadcast_step[0], broadcast_step[1]}\n"
-        
-        "\033[95m# == 3. Misc == #\033[0m\n"
-        f"hybrid_unmerge: {hybrid_unmerge}\n"
     )
 
     # == initialization ==
-    # Make sure the module is not currently patched
     remove_patch(model)
-
     model._tome_info = {
         "size": (latent_size // 2, latent_size // 2),
         "hooks": [],
         "args": {
-            # ==== 1. Merging ==== #
-            "merge_metric": merge_metric,
-            "merge_cond": merge_cond,
+            # 1. Merging #
+            "metric": metric,
             "ratio": ratio,
+            "mode": mode,
+            "prune": prune,
             "sx": sx, "sy": sy,
             "use_rand": use_rand,
             "generator": None,
-            "merge_mlp": merge_mlp,
             "latent_size": latent_size,
+            "merge_cond": merge_cond,
 
-            # == 1.1 Token Merging (Spatial) == #
-            "start_indices": start_indices,
+            "start_blocks": start_blocks,
             "num_blocks": num_blocks,
 
-            # == 1.2 Cache Merging (Spatial-Temporal) == #
-            "cache_merge" : cache_merge,
-            "cache_start_indices": cache_start_indices,
-            "cache_num_blocks": cache_num_blocks,
-            "push_unmerged": push_unmerged,
+            "merge_start": merge_step[0],
+            "merge_end": merge_step[-1],
             "cache_start": cache_start,
             "cache_end": cache_step[-1],
+            "push_unmerged": push_unmerged,
 
-            # ==== 2. Broadcast (Temporal) ==== #
+            # 2. Broadcasting #
             "broadcast": broadcast,
             "broadcast_range": broadcast_range,
             "broadcast_start": broadcast_step[0],
             "broadcast_end": broadcast_step[1],
-            "broadcast_start_indices": broadcast_start_indices,
+            "broadcast_start_blocks": broadcast_start_blocks,
             "broadcast_num_blocks": broadcast_num_blocks,
-
-            # == Hybrid Unmerge == #
-            "hybrid_unmerge": True if hybrid_unmerge > 0.0 else False,
-            "hybrid_threshold": hybrid_unmerge if hybrid_unmerge > 0.0 else 0.0,
         }
     }
 
     model._bus = CacheBus()
 
-    # == Patch PixArtMS Blocks==
-    # == 1. Patch Token Merging Blocks ==
-    if token_merge:
-        for module, index in patch_tome_blocks(model, start_indices, num_blocks, merge_metric):
-            if merge_metric == 'x':
-                make_tome_block_fn = make_diffusers_tome_block if is_diffusers else make_tome_block
-            elif merge_metric == 'k':
-                make_tome_block_fn = make_tome_attention
-            else:
-                raise ValueError(f'"{merge_metric}" is not a legal metric')
+    # patch merging blocks
+    for module, index in yield_blocks(model, start_blocks, num_blocks, metric):
+        if metric == 'x':
+            patch_fn = make_diffusers_tome_block if is_diffusers else make_tome_block
+        elif metric == 'k':
+            patch_fn = make_tome_attention
+        else:
+            raise ValueError(f'"{metric}" is not a valid metric')
 
-            module.__class__ = make_tome_block_fn(module.__class__, mode='token_merge')
-            module._tome_info = model._tome_info
+        module.__class__ = patch_fn(module.__class__, mode=mode)
+        module._tome_info = model._tome_info
+        module._cache = Cache(index=index, cache_bus=model._bus, broadcast_range=broadcast_range)
+        rand_indices = generate_semi_random_indices(module._tome_info["args"]['sy'],
+                                                    module._tome_info["args"]['sx'],
+                                                    module._tome_info["size"][0], module._tome_info["size"][1],
+                                                    steps=merge_step[1] - merge_step[0] + 1)
+        module._cache.cache_bus.rand_indices[module._cache.index] = rand_indices
+        logging.debug(f'Applied merging patch at Block {index}')
 
-            module._cache = Cache(index=index, cache_bus=model._bus, broadcast_range=broadcast_range)
-            logging.debug(f'Applied Token Merging patch at Block {index}')
-
-    # == 2. Patch Cache Merging Blocks ==
-    if cache_merge:
-        for module, index in patch_tome_blocks(model, cache_start_indices, cache_num_blocks, merge_metric):
-            if merge_metric == 'x':
-                make_tome_block_fn = make_diffusers_tome_block if is_diffusers else make_tome_block
-            elif merge_metric == 'k':
-                make_tome_block_fn = make_tome_attention
-            else:
-                raise ValueError(f'"{merge_metric}" is not a legal metric')
-
-            module.__class__ = make_tome_block_fn(module.__class__, mode='cache_merge')
-            module._tome_info = model._tome_info
-
-            module._cache = Cache(index=index, cache_bus=model._bus, broadcast_range=broadcast_range)
-            logging.debug(f'Applied Cache Merging patch at Block {index}')
-
-    # == 3. Patch Broadcast Blocks ==
+    # patch broadcast blocks
     if broadcast:
-        for module, index in patch_tome_blocks(model, broadcast_start_indices, broadcast_num_blocks, 'x'):
-            make_tome_block_fn = make_diffusers_tome_block if is_diffusers else make_tome_block
-            module.__class__ = make_tome_block_fn(module.__class__, mode='broadcast')
+        for module, index in yield_blocks(model, broadcast_start_blocks, broadcast_num_blocks, 'x'):
+            patch_fn = make_diffusers_tome_block if is_diffusers else make_tome_block
+            module.__class__ = patch_fn(module.__class__, mode='broadcast')
             module._tome_info = model._tome_info
 
             module._cache = Cache(index=index, cache_bus=model._bus, broadcast_range=broadcast_range)
-            logging.debug(f'Applied Broadcast patch at Block {index}')
+            logging.debug(f'Applied broadcasting patch at Block {index}')
 
     return model
 

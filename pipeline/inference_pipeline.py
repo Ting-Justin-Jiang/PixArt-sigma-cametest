@@ -1,39 +1,36 @@
-"""
-Something is still off. 8Bit T5 trades performance for memory cost.
-"""
-
 import argparse
-import sys
-import time
-from pathlib import Path
-current_file_path = Path(__file__).resolve()
-sys.path.insert(0, str(current_file_path.parent.parent))
+import gc
 import os
 import random
-import torch
-from torchvision.utils import save_image
-from diffusion import IDDPM, DPMS, SASolverSampler
-from diffusers.models import AutoencoderKL
-from tools.download import find_model
+import re
+import sys
+import time
 from datetime import datetime
-from typing import List, Union
+from glob import iglob
+from pathlib import Path
+
+import lpips
 import numpy as np
+import torch
+import torchvision.transforms as T
+from PIL import Image
+from torchvision.utils import save_image, _log_api_usage_once, make_grid
 from transformers import T5EncoderModel, T5Tokenizer
-import gc
-
-from diffusion.model.t5 import T5Embedder
-from diffusion.model.utils import prepare_prompt_ar, resize_and_crop_tensor
-from diffusion.model.nets import PixArtMS_XL_2, PixArt_XL_2
-from torchvision.utils import _log_api_usage_once, make_grid
-from diffusion.data.datasets.utils import *
-from asset.examples import examples
-from diffusion.utils.dist_utils import flush
-
-from prompt import PROMPT
-from cache_merge import patch
-
 
 MAX_SEED = np.iinfo(np.int32).max
+current_file_path = Path(__file__).resolve() # Ensure correct sys path setup for local imports
+sys.path.insert(0, str(current_file_path.parent.parent))
+
+from cache_merge import patch
+from diffusion import IDDPM, DPMS, SASolverSampler
+from diffusion.data.datasets.utils import *
+from diffusion.model.nets import PixArtMS_XL_2, PixArt_XL_2
+from diffusion.model.t5 import T5Embedder
+from diffusion.model.utils import prepare_prompt_ar, resize_and_crop_tensor
+from diffusion.utils.dist_utils import flush
+from diffusers.models import AutoencoderKL
+from prompt import PROMPT
+from tools.download import find_model
 
 
 def get_args():
@@ -45,44 +42,36 @@ def get_args():
     parser.add_argument('--sdvae', action='store_true', help='sd vae')
 
     # == Sampling configuration == #
-    parser.add_argument('--seed', default=44103688372, type=int, help='Seed for the random generator')
+    parser.add_argument('--seed', default=441036883, type=int, help='Seed for the random generator')
     parser.add_argument('--sampler', default='dpm-solver', type=str, choices=['iddpm', 'dpm-solver', 'sa-solver'])
     parser.add_argument('--sample_steps', default=20, type=int, help='Number of inference steps')
-    parser.add_argument('--guidance_scale', default=7.5, type=float, help='Guidance scale')
+    parser.add_argument('--guidance_scale', default=5.0, type=float, help='Guidance scale')
 
-    # ==== ==== ==== ==== ==== ==== ==== ==== ==== #
     # ==== Acceleration Patch ==== #
-    parser.add_argument('--experiment-folder', type=str, default='samples/inference/cfg=7.5')
+    parser.add_argument('--experiment-folder', type=str, default='samples/inference/cfg=5.0')
+    parser.add_argument("--evaluate-lpips", action=argparse.BooleanOptionalAction, type=bool, default=False)
 
     # ==== 1. Merging ==== #
-    parser.add_argument("--merge-ratio", type=float, default=0.4, help="Ratio of tokens to merge")
+    parser.add_argument("--merge-ratio", type=float, default=0.5)
     parser.add_argument("--merge-metric", type=str, choices=["k", "x"], default="k")
-    parser.add_argument("--merge-cond", action=argparse.BooleanOptionalAction, type=bool, default=False)
+    parser.add_argument("--merge-mode", type=str, choices=["token_merge", "cache_merge"], default="cache_merge")
+    parser.add_argument("--prune", action=argparse.BooleanOptionalAction, type=bool, default=True)
+    parser.add_argument("--merge-cond", action=argparse.BooleanOptionalAction, type=bool, default=False) # only use when you got a low cfg (3.0-4.5)
 
-    # == 1.1 Token Merging (Spatial) == #
-    parser.add_argument("--start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[])
-    parser.add_argument("--num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[])
-
-    # == 1.2 Cache Merging (Spatial-Temporal) == #
-    parser.add_argument("--cache-start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[8, 21])
-    parser.add_argument("--cache-num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[8, 2])
+    parser.add_argument("--merge-step", type=lambda s: (int(item) for item in s.split(',')), default=(4, 18))
     parser.add_argument("--cache-step", type=lambda s: (int(item) for item in s.split(',')), default=(7, 18))
     parser.add_argument("--push-unmerged", action=argparse.BooleanOptionalAction, type=bool, default=True)
 
-    # == 1.2.1 Hybrid Unmerge (Deprecated) == #
-    parser.add_argument("--hybrid-unmerge", type=float, default=0.0, help="cosine similarity threshold, set 0.0 to bypass")
+    parser.add_argument("--start-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[8, 21])
+    parser.add_argument("--num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[9, 3])
 
-    # == 2. Broadcast (Temporal) == #
-    parser.add_argument("--broadcast-range", type=int, default=2, help="broadcast range, set 0 to bypass")
+    # ==== 2. Broadcasting ==== #
+    parser.add_argument("--broadcast-range", type=int, default=1, help="broadcast range, set 1 to bypass")
     parser.add_argument("--broadcast-step", type=lambda s: (int(item) for item in s.split(',')), default=(7, 18))
-    parser.add_argument("--broadcast-start-indices", type=lambda s: [int(item) for item in s.split(',')], default=[1, 16])
-    parser.add_argument("--broadcast-num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[7, 5])
-
-    # == Misc == #
-    parser.add_argument("--temporal-score", action=argparse.BooleanOptionalAction, type=bool, default=False)
+    parser.add_argument("--broadcast-start-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[1, 17])
+    parser.add_argument("--broadcast-num-blocks", type=lambda s: [int(item) for item in s.split(',')], default=[7, 4])
 
     return parser.parse_args()
-
 
 def set_env(seed=0):
     torch.manual_seed(seed)
@@ -219,25 +208,23 @@ if __name__ == '__main__':
 
     if args.merge_ratio > 0.0:
         model = patch.apply_patch(model,
-                                  merge_metric=args.merge_metric,
+                                  metric=args.merge_metric,
                                   ratio=args.merge_ratio,
+                                  mode=args.merge_mode,
+                                  prune=args.prune,
+                                  sx=2, sy=2, latent_size=latent_size,
                                   merge_cond=args.merge_cond,
-                                  sx=1, sy=3, latent_size=latent_size,
 
-                                  start_indices=args.start_indices,
-                                  num_blocks=args.num_blocks,
-
-                                  cache_start_indices=args.cache_start_indices,
-                                  cache_num_blocks=args.cache_num_blocks,
+                                  merge_step=args.merge_step,
                                   cache_step=args.cache_step,
+                                  start_blocks=args.start_blocks,
+                                  num_blocks=args.num_blocks,
                                   push_unmerged=args.push_unmerged,
 
                                   broadcast_range=args.broadcast_range,
                                   broadcast_step=args.broadcast_step,
-                                  broadcast_start_indices=args.broadcast_start_indices,
-                                  broadcast_num_blocks=args.broadcast_num_blocks,
-
-                                  hybrid_unmerge=args.hybrid_unmerge)
+                                  broadcast_start_blocks=args.broadcast_start_blocks,
+                                  broadcast_num_blocks=args.broadcast_num_blocks)
 
     model.eval()
     base_ratios = eval(f'ASPECT_RATIO_{args.image_size}_TEST')
@@ -248,7 +235,7 @@ if __name__ == '__main__':
         vae = AutoencoderKL.from_pretrained(f"PixArt-alpha/pixart_sigma_sdxlvae_T5_diffusers", subfolder="vae").to(device).to(weight_dtype)
 
     tokenizer = T5Tokenizer.from_pretrained("PixArt-alpha/pixart_sigma_sdxlvae_T5_diffusers", subfolder="tokenizer")
-    text_encoder = T5EncoderModel.from_pretrained("PixArt-alpha/pixart_sigma_sdxlvae_T5_diffusers", load_in_8bit=True, subfolder="text_encoder")
+    text_encoder = T5EncoderModel.from_pretrained("PixArt-alpha/pixart_sigma_sdxlvae_T5_diffusers", subfolder="text_encoder").to(device)
     null_caption_token = tokenizer("", max_length=max_sequence_length, padding="max_length", truncation=True, return_tensors="pt").to(device)
     null_caption_embs = text_encoder(null_caption_token.input_ids, attention_mask=null_caption_token.attention_mask)[0]
 
@@ -266,12 +253,35 @@ if __name__ == '__main__':
 
     outputs = torch.stack(outputs, dim=0)
 
-    # Save and display images:
-    if args.merge_ratio > 0.0:
-        save_path = f"{args.experiment_folder}/{args.merge_metric}_merge-{args.merge_ratio}-token_{args.start_indices}-cache_{args.cache_start_indices}-broadcast_{args.broadcast_range}_{args.broadcast_start_indices}.png"
+    output_name = os.path.join(args.experiment_folder, "img_{idx}.jpg")
+    if not os.path.exists(args.experiment_folder):
+        os.makedirs(args.experiment_folder)
+        idx = 0
     else:
-        save_path = f"{args.experiment_folder}/no-merge.png"
+        fns = [fn for fn in iglob(output_name.format(idx="*")) if re.search(r"img_[0-9]+\.jpg$", fn)]
+        if len(fns) > 0:
+            idx = max(int(fn.split("_")[-1].split(".")[0]) for fn in fns) + 1
+        else:
+            idx = 0
 
-    save_image(outputs, save_path, nrow=4, normalize=True, value_range=(-1, 1))
+    if args.merge_ratio == 0.0:
+        fn = f"{args.experiment_folder}/baseline.png"
+    else:
+        fn = output_name.format(idx=idx)
+
+    save_image(outputs, fn, nrow=4, normalize=True, value_range=(-1, 1))
+
+    # Evaluate LPIPS
+    if args.evaluate_lpips and args.merge_ratio > 0.0:
+        p_r_path = f"{args.experiment_folder}/baseline.png"
+        if not os.path.exists(p_r_path):
+            print("Baseline image does not exist!")
+        else:
+            print("Evaluating LPIPS")
+            p_r = T.Compose([T.ToTensor(), T.Normalize(0.5, 0.5)])(Image.open(p_r_path).convert('RGB')).to(device)
+            p_o = T.Normalize(0.5, 0.5)(outputs).to(device)
+            loss_fn_alex = lpips.LPIPS(net='alex').to(device)
+            d = loss_fn_alex(p_r, p_o)
+            print(f"LPIPS: {d}")
 
     print(f"Finish sampling {len(prompts)} images in {total_runtime} seconds.")
