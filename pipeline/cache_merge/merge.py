@@ -32,16 +32,6 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
     if r <= 0:
         return do_nothing, do_nothing
 
-    # Force deactivate
-    if cache.step < tome_info['args']['merge_start'] or cache.step > tome_info['args']['merge_end']:
-        if cache.step == tome_info['args']['merge_start'] - 1 and unmerge_mode == 'cache_merge':
-            def initial_push(x: torch.Tensor, mode: str = None):
-                        cache.push(x)
-                        return x
-            return do_nothing, initial_push
-        else:
-            return do_nothing, do_nothing
-
     gather = mps_gather_workaround if metric.device.type == "mps" else torch.gather
 
     with torch.no_grad():
@@ -148,7 +138,7 @@ def bipartite_soft_matching_random2d(metric: torch.Tensor,
 
         # For the first step
         if unmerge_mode == 'cache_merge' and cache.feature_map is None:
-            cache.push(out)
+            cache.push_all(out)
 
         return out
 
